@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>보행 통행량 카운터</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+    <script defer src="./app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Pedestrian Flow Counter</p>
+          <h1>지정 구역 통행 인원을 1시간 단위로 집계합니다.</h1>
+          <p class="hero-copy">
+            영상을 올린 뒤 화면에서 관심 구역을 드래그로 지정하면, 브라우저 안에서 사람을 감지하고
+            시간대별 통행량을 계산합니다.
+          </p>
+        </div>
+        <div class="hero-card">
+          <div class="metric">
+            <span>분석 방식</span>
+            <strong>사람 감지 + 간단 추적</strong>
+          </div>
+          <div class="metric">
+            <span>집계 기준</span>
+            <strong>구역 진입 시각</strong>
+          </div>
+          <div class="metric">
+            <span>출력</span>
+            <strong>시간대별 표 / CSV</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel controls-panel">
+          <div class="panel-header">
+            <h2>1. 영상과 옵션</h2>
+            <p>영상 업로드 후 첫 프레임에 관심 구역을 지정하세요.</p>
+          </div>
+
+          <label class="field">
+            <span>영상 파일</span>
+            <input id="videoInput" type="file" accept="video/*" />
+          </label>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>샘플링 간격(초)</span>
+              <input id="sampleInterval" type="number" min="0.2" step="0.1" value="1.0" />
+            </label>
+            <label class="field">
+              <span>감지 신뢰도</span>
+              <input id="scoreThreshold" type="number" min="0.1" max="0.95" step="0.05" value="0.55" />
+            </label>
+            <label class="field">
+              <span>트랙 연결 거리(px)</span>
+              <input id="matchDistance" type="number" min="20" max="300" step="10" value="90" />
+            </label>
+            <label class="field">
+              <span>재카운트 방지 시간(초)</span>
+              <input id="recountCooldown" type="number" min="1" max="60" step="1" value="8" />
+            </label>
+          </div>
+
+          <div class="button-row">
+            <button id="loadModelButton" class="secondary">모델 미리 불러오기</button>
+            <button id="processButton" class="primary" disabled>분석 시작</button>
+            <button id="resetButton" class="ghost">초기화</button>
+          </div>
+
+          <div class="status-strip">
+            <div>
+              <span class="status-label">상태</span>
+              <strong id="statusText">영상 파일을 선택해 주세요.</strong>
+            </div>
+            <div>
+              <span class="status-label">진행률</span>
+              <strong id="progressText">0%</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel viewer-panel">
+          <div class="panel-header">
+            <h2>2. 관심 구역 지정</h2>
+            <p>영상 미리보기에서 드래그해 사각형을 지정하세요.</p>
+          </div>
+
+          <div class="viewer-stage">
+            <video id="videoPreview" class="video-preview" controls muted playsinline preload="auto"></video>
+            <canvas id="overlayCanvas" class="overlay-canvas"></canvas>
+            <div id="emptyState" class="empty-state">영상 파일을 올리면 여기에 첫 프레임이 표시됩니다.</div>
+          </div>
+
+          <div class="viewer-caption">
+            <span id="roiText">관심 구역이 아직 지정되지 않았습니다.</span>
+          </div>
+        </section>
+
+        <section class="panel results-panel">
+          <div class="panel-header">
+            <h2>3. 집계 결과</h2>
+            <p>시간대별 통행 수와 이벤트 로그를 확인하고 CSV로 저장할 수 있습니다.</p>
+          </div>
+
+          <div class="results-summary">
+            <div class="summary-card">
+              <span>총 통행 수</span>
+              <strong id="totalCount">0</strong>
+            </div>
+            <div class="summary-card">
+              <span>분석 길이</span>
+              <strong id="durationLabel">0분</strong>
+            </div>
+            <div class="summary-card">
+              <span>선택 구역</span>
+              <strong id="roiSizeLabel">미지정</strong>
+            </div>
+          </div>
+
+          <div class="button-row compact">
+            <button id="downloadCsvButton" class="secondary" disabled>CSV 다운로드</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>시간 구간</th>
+                  <th>통행 수</th>
+                </tr>
+              </thead>
+              <tbody id="resultsBody">
+                <tr>
+                  <td colspan="2" class="placeholder-cell">아직 분석 결과가 없습니다.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="event-log">
+            <div class="event-log-header">
+              <h3>이벤트 로그</h3>
+              <span>구역에 진입한 시점 기록</span>
+            </div>
+            <ul id="eventList">
+              <li class="placeholder-cell">분석을 실행하면 로그가 표시됩니다.</li>
+            </ul>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

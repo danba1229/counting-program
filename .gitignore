@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+.venv/
+venv/
+
+ocr_debug_*.png
+ocr_debug_last_run.csv
+_cwd_write_test.png
+_export_test.xlsx
