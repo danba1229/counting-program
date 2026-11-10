@@ -80,8 +80,11 @@ class SweptPathApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("차량 회전 궤적 검토")
-        root.geometry("1400x860")
-        root.minsize(1000, 640)
+        # 화면 크기에 맞춰 창 크기 결정 (작업표시줄 여유 포함)
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1400, sw - 40), min(860, sh - 100)
+        root.geometry(f"{w}x{h}+{max((sw - w) // 2, 0)}+{max((sh - h) // 2 - 30, 0)}")
+        root.minsize(min(1000, w), min(600, h))
 
         self.library = VehicleLibrary(USER_VEHICLE_FILE)
         self.drawing: Drawing | None = None
@@ -125,6 +128,14 @@ class SweptPathApp:
         menubar.add_cascade(label="파일", menu=fmenu)
         self.root.config(menu=menubar)
 
+        # 하단 요소를 먼저 배치해야 창이 작을 때도 잘리지 않는다.
+        self.status = tk.StringVar()
+        bar = ttk.Frame(self.root)
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(bar, textvariable=self.status, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self.coord_var = tk.StringVar()
+        ttk.Label(bar, textvariable=self.coord_var, width=34, anchor="e").pack(side=tk.RIGHT, padx=6)
+
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True)
 
@@ -133,6 +144,11 @@ class SweptPathApp:
         right = ttk.Frame(main)
         main.add(right, weight=1)
 
+        run_frame = ttk.Frame(left)
+        run_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 6))
+        self.run_btn = ttk.Button(run_frame, text="▶ 회전 검토 실행", command=self.run_check)
+        self.run_btn.pack(fill=tk.X, ipady=6)
+
         self.nb = ttk.Notebook(left)
         self.nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self._build_drawing_tab()
@@ -140,22 +156,10 @@ class SweptPathApp:
         self._build_path_tab()
         self._build_result_tab()
 
-        run_frame = ttk.Frame(left)
-        run_frame.pack(fill=tk.X, padx=4, pady=(0, 6))
-        self.run_btn = ttk.Button(run_frame, text="▶ 회전 검토 실행", command=self.run_check)
-        self.run_btn.pack(fill=tk.X, ipady=6)
-
         self.canvas = tk.Canvas(right, bg="white", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.verdict_label = tk.Label(self.canvas, text="", font=("", 14, "bold"), bg="white")
         self.verdict_label.place(x=10, y=8)
-
-        self.status = tk.StringVar()
-        bar = ttk.Frame(self.root)
-        bar.pack(fill=tk.X)
-        ttk.Label(bar, textvariable=self.status, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        self.coord_var = tk.StringVar()
-        ttk.Label(bar, textvariable=self.coord_var, width=34, anchor="e").pack(side=tk.RIGHT, padx=6)
 
     # ---------------- 도면 탭 ----------------
     def _build_drawing_tab(self) -> None:
@@ -179,7 +183,7 @@ class SweptPathApp:
         ttk.Label(tab, text="장애물 레이어 (선택된 레이어의 선을 벽·기둥으로 간주)").pack(anchor="w", pady=(8, 2))
         lf = ttk.Frame(tab)
         lf.pack(fill=tk.BOTH, expand=True)
-        self.layer_list = tk.Listbox(lf, selectmode=tk.MULTIPLE, exportselection=False, height=18)
+        self.layer_list = tk.Listbox(lf, selectmode=tk.MULTIPLE, exportselection=False, height=6)
         sb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.layer_list.yview)
         self.layer_list.config(yscrollcommand=sb.set)
         self.layer_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -206,7 +210,7 @@ class SweptPathApp:
         self.vehicle_box = ttk.Combobox(tab, textvariable=self.vehicle_var, state="readonly")
         self.vehicle_box.pack(fill=tk.X, pady=2)
         self.vehicle_box.bind("<<ComboboxSelected>>", lambda e: self._on_vehicle_change())
-        self.vehicle_info = tk.Text(tab, height=20, wrap="word", relief="flat", bg="#f6f6f6")
+        self.vehicle_info = tk.Text(tab, height=8, wrap="word", relief="flat", bg="#f6f6f6")
         self.vehicle_info.pack(fill=tk.BOTH, expand=True, pady=4)
         btns = ttk.Frame(tab)
         btns.pack(fill=tk.X)
@@ -235,7 +239,7 @@ class SweptPathApp:
         ttk.Label(gear_frame, text="(전진↔후진이 바뀌는 점에서 정지 후 방향전환)",
                   foreground="#666").pack(side=tk.LEFT)
 
-        self.point_list = tk.Listbox(tab, height=8, exportselection=False)
+        self.point_list = tk.Listbox(tab, height=4, exportselection=False)
         self.point_list.pack(fill=tk.BOTH, expand=True, pady=2)
         pb = ttk.Frame(tab)
         pb.pack(fill=tk.X)
@@ -266,7 +270,7 @@ class SweptPathApp:
     def _build_result_tab(self) -> None:
         tab = ttk.Frame(self.nb, padding=6)
         self.nb.add(tab, text="4. 결과")
-        self.result_text = tk.Text(tab, height=18, wrap="word")
+        self.result_text = tk.Text(tab, height=8, wrap="word")
         self.result_text.pack(fill=tk.BOTH, expand=True)
 
         show = ttk.LabelFrame(tab, text="표시", padding=4)
