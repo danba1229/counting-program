@@ -1,0 +1,70 @@
+name: Build SweptPathChecker (Windows exe)
+
+on:
+  push:
+    paths:
+      - "swept-path-checker/**"
+      - ".github/workflows/build-swept-path-checker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: swept-path-checker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Build exe
+        run: pyinstaller --noconfirm SweptPathChecker.spec
+
+      - name: Self-test the built exe
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path dist\SweptPathChecker\SweptPathChecker.exe
+          $p = Start-Process -FilePath $exe -ArgumentList '--selftest' -Wait -PassThru
+          Get-Content dist\SweptPathChecker\selftest_result.txt -Encoding UTF8
+          "exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+          Remove-Item dist\SweptPathChecker\selftest_result.txt
+
+      - name: Self-test from another working directory
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path dist\SweptPathChecker\SweptPathChecker.exe
+          Push-Location $env:RUNNER_TEMP
+          $p = Start-Process -FilePath $exe -ArgumentList '--selftest' -Wait -PassThru
+          Pop-Location
+          if ($p.ExitCode -ne 0) { Get-Content dist\SweptPathChecker\selftest_result.txt -Encoding UTF8; exit 1 }
+          Remove-Item dist\SweptPathChecker\selftest_result.txt
+          "OK"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item packaging\사용법.txt dist\SweptPathChecker\
+          Copy-Item README.md dist\SweptPathChecker\README.md
+          Compress-Archive -Path dist\SweptPathChecker -DestinationPath SweptPathChecker-windows.zip
+          "{0:N1} MB" -f ((Get-Item SweptPathChecker-windows.zip).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweptPathChecker-windows
+          path: swept-path-checker/SweptPathChecker-windows.zip
+          retention-days: 30

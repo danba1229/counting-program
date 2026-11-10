@@ -18,7 +18,28 @@ CAD 프로그램 안에서 돌아가는 플러그인이 아니라 **독립 실�
 | 결과 | 차체 궤적(스웹트 패스), 여유폭 외곽, 바퀴·모서리 궤적, 차량 윤곽, 충돌 위치, 위치 슬라이더 |
 | 저장 | 원본 도면 + 결과 레이어 DXF, 결과만 DXF, 검토 보고서(txt), 작업 파일(json) |
 
-## 설치 및 실행 (Windows)
+## 실행 파일(exe)로 쓰기 — Python 설치 불필요
+
+1. GitHub 저장소의 **Actions → Build SweptPathChecker (Windows exe)** 에서 최근 실행을 열고,
+   맨 아래 **Artifacts** 의 `SweptPathChecker-windows` 를 내려받습니다.
+2. 압축을 풀고 `SweptPathChecker\SweptPathChecker.exe` 를 실행합니다.
+   - `_internal` 폴더와 함께 있어야 합니다. exe만 따로 옮기면 실행되지 않습니다.
+   - 서명되지 않은 프로그램이라 처음에 "Windows의 PC 보호" 창이 뜰 수 있습니다. **추가 정보 → 실행**을 누르세요.
+3. `파일 → 샘플 도면 열기`로 바로 시험해 볼 수 있습니다.
+
+`SweptPathChecker.exe --selftest` 를 실행하면 계산·저장·화면 동작을 자체 점검하고 `selftest_result.txt` 를 남깁니다.
+`swept-path-checker/` 아래 파일이 바뀌어 푸시될 때마다 Windows 서버에서 빌드, 테스트, exe 자체 점검이 자동으로 실행됩니다.
+
+### 직접 빌드하기
+
+```powershell
+pip install -r requirements.txt pyinstaller
+pyinstaller --noconfirm SweptPathChecker.spec
+```
+
+결과물: `dist\SweptPathChecker\` 폴더
+
+## Python으로 실행 (Windows)
 
 1. Python 3.10 이상 설치 (설치 시 "Add python.exe to PATH" 체크)
 2. 이 폴더에서 패키지 설치
@@ -115,6 +136,9 @@ swept-path-checker/
 │  ├─ analysis.py         충돌 검사, 궤적 계산, 판정
 │  ├─ drawing.py          DXF/DWG 읽기, 레이어·단위 처리
 │  └─ export.py           DXF/보고서/작업 파일 저장
+├─ selftest.py            실행 파일 자체 점검 (--selftest)
+├─ SweptPathChecker.spec  PyInstaller 빌드 설정
+├─ packaging/             exe와 함께 배포하는 사용법
 ├─ samples/               샘플 도면 및 생성 스크립트
 └─ tests/                 자동 테스트 (python -m pytest)
 ```

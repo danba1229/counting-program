@@ -32,8 +32,15 @@ from swept_path.geometry import body_polygons  # noqa: E402
 from swept_path.simulate import FORWARD, REVERSE, Scenario, SimOptions, Simulator, Waypoint  # noqa: E402
 from swept_path.vehicles import SEMITRAILER, SINGLE, Vehicle, VehicleLibrary  # noqa: E402
 
-APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # 실행 파일(exe): 사용자 파일은 exe 옆, 내장 자료는 압축 해제 폴더
+    APP_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+else:
+    APP_DIR = Path(__file__).resolve().parent
+    RESOURCE_DIR = APP_DIR
 USER_VEHICLE_FILE = APP_DIR / "user_vehicles.json"
+SAMPLE_DRAWING = RESOURCE_DIR / "samples" / "sample_parking.dxf"
 
 COLOR_OBSTACLE = "#202020"
 COLOR_OTHER = "#c8c8c8"
@@ -109,6 +116,7 @@ class SweptPathApp:
         menubar = tk.Menu(self.root)
         fmenu = tk.Menu(menubar, tearoff=0)
         fmenu.add_command(label="도면 열기...", command=self.open_drawing)
+        fmenu.add_command(label="샘플 도면 열기", command=self.open_sample)
         fmenu.add_separator()
         fmenu.add_command(label="작업 저장...", command=self.save_project)
         fmenu.add_command(label="작업 불러오기...", command=self.load_project)
@@ -442,6 +450,12 @@ class SweptPathApp:
         self.fit_view()
         skipped = ", ".join(f"{k} {v}" for k, v in sorted(drawing.skipped.items()))
         self.set_status("도면을 열었습니다." + (f"  제외된 객체: {skipped}" if skipped else ""))
+
+    def open_sample(self) -> None:
+        if SAMPLE_DRAWING.exists():
+            self.open_drawing(str(SAMPLE_DRAWING))
+        else:
+            messagebox.showinfo("안내", f"샘플 도면이 없습니다:\n{SAMPLE_DRAWING}")
 
     def _fill_layer_list(self) -> None:
         self.layer_list.delete(0, tk.END)
@@ -1081,14 +1095,19 @@ class VehicleDialog(tk.Toplevel):
 
 
 def main() -> None:
+    if "--selftest" in sys.argv:
+        from selftest import run_selftest
+
+        sys.exit(run_selftest(SAMPLE_DRAWING, APP_DIR, SweptPathApp))
     root = tk.Tk()
     try:
         ttk.Style().theme_use("vista" if sys.platform == "win32" else "clam")
     except tk.TclError:
         pass
     app = SweptPathApp(root)
-    if len(sys.argv) > 1:
-        root.after(100, lambda: app.open_drawing(sys.argv[1]))
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if args:
+        root.after(100, lambda: app.open_drawing(args[0]))
     root.mainloop()
 
 
