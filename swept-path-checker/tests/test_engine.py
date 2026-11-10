@@ -178,3 +178,60 @@ def test_vehicle_library_user_file(tmp_path):
 def test_vehicle_validation():
     bad = Vehicle(key="x", name="x", wheelbase=5.0, min_turn_radius=4.0)
     assert bad.validate()
+
+
+def test_block_cache_transforms(tmp_path):
+    """블록 캐시 + 행렬 변환: 중첩 블록, 회전, 비균일 배율, 기준점, 0 레이어 상속."""
+    import ezdxf
+
+    doc = ezdxf.new()
+    inner = doc.blocks.new("IN", base_point=(10, 0))
+    inner.add_line((10, 0), (30, 0))
+    inner.add_circle((20, 0), 1, dxfattribs={"layer": "원"})
+    outer = doc.blocks.new("OUT", base_point=(100, 50))
+    outer.add_blockref("IN", (100, 50), dxfattribs={"rotation": 45})
+    msp = doc.modelspace()
+    msp.add_blockref("OUT", (1000, 2000), dxfattribs={"rotation": 30, "xscale": 2, "yscale": -1, "layer": "기둥"})
+    msp.add_blockref("OUT", (0, 0), dxfattribs={"rotation": 90, "layer": "기둥"})
+    path = tmp_path / "blocks.dxf"
+    doc.saveas(path)
+    d = load_drawing(path)
+    lines = [p for p, l in zip(d.polylines, d.layers) if l == "기둥"]
+    assert {l for l in d.layers} == {"기둥", "원"}  # 0 레이어 → 삽입 레이어, 지정 레이어 유지
+
+    def expected(local, scale, rot, ins):
+        x, y = local[0] * scale[0], local[1] * scale[1]
+        c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+        return (x * c - y * s + ins[0], x * s + y * c + ins[1])
+
+    # IN 블록 선 (0,0)-(20,0) → 45° 회전 → OUT 블록 좌표 (0,0)-(14.142, 14.142)
+    end_local = (20 * math.cos(math.radians(45)), 20 * math.sin(math.radians(45)))
+    got_ends = sorted(tuple(np.round(p[-1], 4)) for p in lines)
+    want_ends = sorted([
+        tuple(np.round(expected(end_local, (2, -1), 30, (1000, 2000)), 4)),
+        tuple(np.round(expected(end_local, (1, 1), 90, (0, 0)), 4)),
+    ])
+    assert got_ends == want_ends
+    # 원 중심 (IN 좌표 (10,0) 기준점 기준) 도 같은 변환을 따른다
+    circles = [p for p, l in zip(d.polylines, d.layers) if l == "원"]
+    centre_local = (10 * math.cos(math.radians(45)), 10 * math.sin(math.radians(45)))
+    want_c = np.array(expected(centre_local, (1, 1), 90, (0, 0)))
+    assert any(np.allclose(c.mean(axis=0), want_c, atol=0.05) for c in circles)
+
+
+def test_renderer_draws_visible_lines_only(sample):
+    from swept_path.render import DrawingRenderer, preview_transform
+
+    d = load_drawing(sample)
+    r = DrawingRenderer(d)
+    s, tx, ty = 20.0, 10.0, 750.0  # 0~40 m 가 화면 안에 들어오는 변환
+    img = r.render(900, 800, s, tx, ty, {"벽"})
+    arr = np.asarray(img)
+    # 남쪽 벽 (y=0 → 화면 y=750) 이 검게 그려져야 함
+    assert (arr[748:753, 100:700] < 80).all(axis=2).any()
+    # 화면 밖으로 이동하면 아무것도 안 그림
+    empty = np.asarray(r.render(900, 800, s, tx + 5000, ty, {"벽"}))
+    assert (empty == 255).all()
+    # 미리보기: 오른쪽으로 30px 이동한 변환이면 이미지도 30px 이동
+    moved = np.asarray(preview_transform(img, (s, tx, ty), (s, tx + 30, ty), (900, 800)))
+    assert (moved[:, 130:600] == arr[:, 100:570]).all()

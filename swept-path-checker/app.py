@@ -20,6 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 import traceback
 
 import numpy as np
+from PIL import ImageTk
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -29,6 +30,7 @@ from swept_path.export import (  # noqa: E402
     export_dxf, export_report, load_project, save_project, scenario_from_dict, scenario_to_dict,
 )
 from swept_path.geometry import body_polygons  # noqa: E402
+from swept_path.render import DrawingRenderer, preview_transform  # noqa: E402
 from swept_path.simulate import FORWARD, REVERSE, Scenario, SimOptions, Simulator, Waypoint  # noqa: E402
 from swept_path.vehicles import SEMITRAILER, SINGLE, Vehicle, VehicleLibrary  # noqa: E402
 
@@ -105,6 +107,12 @@ class SweptPathApp:
         self.ty = 500.0
         self._drag = None
         self._busy = False
+        self._loading = False
+        # 도면 이미지 렌더링 상태
+        self.renderer: DrawingRenderer | None = None
+        self._dwg_photo = None
+        self._dwg_base = None  # (PIL 이미지, (s, tx, ty))
+        self._render_job = None
 
         self._build_ui()
         self._refresh_vehicle_list()
@@ -327,7 +335,7 @@ class SweptPathApp:
         c.bind("<Button-4>", lambda e: self._zoom(e.x, e.y, 1.2))
         c.bind("<Button-5>", lambda e: self._zoom(e.x, e.y, 1 / 1.2))
         c.bind("<Motion>", self._on_motion)
-        c.bind("<Configure>", lambda e: self._update_hud())
+        c.bind("<Configure>", lambda e: (self._update_hud(), self.schedule_render(preview=False)))
         self.root.bind("<Delete>", lambda e: self.delete_selected_point())
         self.root.bind("<Escape>", lambda e: self._cancel_drag())
 
@@ -337,6 +345,7 @@ class SweptPathApp:
         self.tx = cx + (self.tx - cx) * f
         self.ty = cy + (self.ty - cy) * f
         self._update_hud()
+        self.schedule_render(preview=True)
 
     def _pan_start(self, e) -> None:
         self._pan = (e.x, e.y)
@@ -345,8 +354,10 @@ class SweptPathApp:
         dx, dy = e.x - self._pan[0], e.y - self._pan[1]
         self._pan = (e.x, e.y)
         self.canvas.move("world", dx, dy)
+        self.canvas.move("dwgimg", dx, dy)  # 이미지는 옮기기만 하고, 멈추면 다시 그린다
         self.tx += dx
         self.ty += dy
+        self.schedule_render(preview=False)
 
     def _on_motion(self, e) -> None:
         x, y = self.c2w(e.x, e.y)
@@ -418,7 +429,10 @@ class SweptPathApp:
     # ==================================================================
     # 도면
     # ==================================================================
-    def open_drawing(self, path: str | None = None) -> None:
+    def open_drawing(self, path: str | None = None, wait: bool = False) -> None:
+        """도면 열기. 기본은 백그라운드에서 읽어 창이 멈추지 않게 한다 (wait=True 면 바로 읽음)."""
+        if self._loading:
+            return
         if path is None:
             path = filedialog.askopenfilename(
                 title="도면 열기",
@@ -426,28 +440,69 @@ class SweptPathApp:
             )
         if not path:
             return
-        self.set_status("도면 읽는 중...")
-        self.root.update_idletasks()
-        try:
-            t0 = time.time()
-            drawing = load_drawing(path)
-        except DrawingError as exc:
-            messagebox.showerror("도면 열기 실패", str(exc))
-            self.set_status("도면 열기 실패")
+        t0 = time.time()
+        if wait:
+            try:
+                drawing = load_drawing(path)
+            except Exception as exc:
+                self._on_drawing_error(exc)
+                return
+            self._apply_drawing(drawing, path, time.time() - t0)
             return
-        except Exception as exc:  # pragma: no cover
-            traceback.print_exc()
-            messagebox.showerror("도면 열기 실패", f"{type(exc).__name__}: {exc}")
-            self.set_status("도면 열기 실패")
-            return
+
+        self._loading = True
+        self.root.config(cursor="watch")
+        q: queue.Queue = queue.Queue()
+
+        def work():
+            try:
+                d = load_drawing(path, progress=lambda msg: q.put(("progress", msg)))
+                q.put(("ok", d))
+            except Exception as exc:
+                traceback.print_exc()
+                q.put(("error", exc))
+
+        last = {"msg": "도면 읽는 중..."}
+
+        def poll():
+            try:
+                while True:
+                    kind, payload = q.get_nowait()
+                    if kind == "progress":
+                        last["msg"] = payload
+                        continue
+                    self._loading = False
+                    self.root.config(cursor="")
+                    if kind == "ok":
+                        self._apply_drawing(payload, path, time.time() - t0)
+                    else:
+                        self._on_drawing_error(payload)
+                    return
+            except queue.Empty:
+                pass
+            self.set_status(f"{Path(path).name}: {last['msg']} ({time.time() - t0:.0f}초)")
+            self.root.after(100, poll)
+
+        threading.Thread(target=work, daemon=True).start()
+        self.set_status(f"{Path(path).name}: 도면 읽는 중...")
+        self.root.after(100, poll)
+
+    def _on_drawing_error(self, exc: Exception) -> None:
+        msg = str(exc) if isinstance(exc, DrawingError) else f"{type(exc).__name__}: {exc}"
+        messagebox.showerror("도면 열기 실패", msg)
+        self.set_status("도면 열기 실패")
+
+    def _apply_drawing(self, drawing: Drawing, path: str, elapsed: float) -> None:
         self.drawing = drawing
+        self.renderer = DrawingRenderer(drawing)
+        self._dwg_base = None
         self._obstacle_cache = None
         unit_name = next((k for k, v in UNIT_CHOICES.items() if abs(v - drawing.unit_scale) < 1e-12), "mm")
         self.unit_var.set(unit_name)
         self.unit_info.set("(추정값 - 확인 필요)" if drawing.unit_guessed else "(도면 설정값)")
         self.file_var.set(f"{Path(path).name}\n선 {len(drawing.polylines):,}개, 레이어 {len(drawing.layer_counts)}개"
-                          f"  ({time.time() - t0:.1f}초)")
-        self.layer_names = sorted(drawing.layer_counts)
+                          f"  ({elapsed:.1f}초)")
+        self.layer_names = list(drawing.layer_names)
         self.obstacle_layers = drawing.default_obstacle_layers()
         self._fill_layer_list()
         self.clear_results()
@@ -490,12 +545,7 @@ class SweptPathApp:
             self._recolor_layers()
 
     def _recolor_layers(self) -> None:
-        for i, name in enumerate(self.layer_names):
-            color = COLOR_OBSTACLE if name in self.obstacle_layers else COLOR_OTHER
-            self.canvas.itemconfigure(f"layer{i}", fill=color)
-            if name in self.obstacle_layers:
-                self.canvas.tag_raise(f"layer{i}")
-        self.canvas.tag_raise("overlay")
+        self.render_drawing()
 
     def _on_unit_change(self) -> None:
         if not self.drawing:
@@ -516,17 +566,47 @@ class SweptPathApp:
         self.clear_results()
         self.fit_view()
 
-    def _draw_drawing(self) -> None:
-        self.canvas.delete("dwg")
-        if not self.drawing:
+    # ---------------- 도면 이미지 ----------------
+    def render_drawing(self) -> None:
+        """현재 화면 변환으로 도면 이미지를 다시 그린다."""
+        if self._render_job is not None:
+            self.root.after_cancel(self._render_job)
+            self._render_job = None
+        c = self.canvas
+        if not self.renderer:
+            c.delete("dwgimg")
+            self._dwg_photo = None
             return
-        index = {name: i for i, name in enumerate(self.layer_names)}
-        sc = self.drawing.unit_scale
-        for pts, layer in zip(self.drawing.polylines, self.drawing.layers):
-            color = COLOR_OBSTACLE if layer in self.obstacle_layers else COLOR_OTHER
-            self.canvas.create_line(self._flat(pts * sc), fill=color, width=1,
-                                    tags=("world", "dwg", f"layer{index[layer]}"))
-        self._recolor_layers()
+        w, h = max(c.winfo_width(), 1), max(c.winfo_height(), 1)
+        img = self.renderer.render(w, h, self.s, self.tx, self.ty, self.obstacle_layers)
+        self._dwg_base = (img, (self.s, self.tx, self.ty))
+        self._show_image(img)
+
+    def _show_image(self, img) -> None:
+        c = self.canvas
+        photo = self._dwg_photo
+        items = c.find_withtag("dwgimg")
+        if photo is not None and items and (photo.width(), photo.height()) == img.size:
+            photo.paste(img)  # 같은 크기면 기존 이미지에 덮어쓰기 (새로 만드는 것보다 빠름)
+            c.coords(items[0], 0, 0)
+            return
+        self._dwg_photo = ImageTk.PhotoImage(img)
+        c.delete("dwgimg")
+        c.create_image(0, 0, image=self._dwg_photo, anchor="nw", tags=("dwgimg",))
+        c.tag_lower("dwgimg")
+
+    def schedule_render(self, preview: bool) -> None:
+        """확대·이동 중에는 기존 이미지를 늘려 바로 보여주고, 멈추면 선명하게 다시 그린다."""
+        if not self.renderer:
+            return
+        if preview and self._dwg_base is not None:
+            base, view = self._dwg_base
+            c = self.canvas
+            size = (max(c.winfo_width(), 1), max(c.winfo_height(), 1))
+            self._show_image(preview_transform(base, view, (self.s, self.tx, self.ty), size))
+        if self._render_job is not None:
+            self.root.after_cancel(self._render_job)
+        self._render_job = self.root.after(120, self.render_drawing)
 
     def fit_view(self) -> None:
         bounds = None
@@ -550,7 +630,7 @@ class SweptPathApp:
 
     def redraw_all(self) -> None:
         self.canvas.delete("world")
-        self._draw_drawing()
+        self.render_drawing()
         self.draw_path()
         self.draw_results()
         self._update_hud()
@@ -990,10 +1070,11 @@ class SweptPathApp:
         try:
             data = load_project(path)
             if data.get("drawing") and Path(data["drawing"]).exists():
-                self.open_drawing(data["drawing"])
+                self.open_drawing(data["drawing"], wait=True)
                 if data.get("unit") in UNIT_CHOICES and self.drawing:
                     self.unit_var.set(data["unit"])
                     self.drawing.unit_scale = UNIT_CHOICES[data["unit"]]
+                    self._dwg_base = None
                 self.obstacle_layers = set(data.get("obstacle_layers", [])) & set(self.layer_names)
                 self._fill_layer_list()
             elif data.get("drawing"):

@@ -31,6 +31,9 @@ jobs:
       - name: Unit tests
         run: python -m pytest -q
 
+      - name: View speed benchmark (old canvas items vs image rendering)
+        run: python tools/bench_view.py
+
       - name: Build exe
         run: pyinstaller --noconfirm SweptPathChecker.spec
 

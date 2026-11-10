@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files
 datas = [("samples/sample_parking.dxf", "samples")]
 # ezdxf 리소스만 포함 (C 소스 등 빌드용 파일 제외)
 datas += collect_data_files("ezdxf", excludes=["**/*.c", "**/*.pyx", "**/*.pxd", "**/*.h"])
-hiddenimports = ["ezdxf.addons.odafc", "selftest"]
+hiddenimports = ["ezdxf.addons.odafc", "selftest", "PIL.ImageTk", "PIL._tkinter_finder"]
 
 a = Analysis(
     ["app.py"],

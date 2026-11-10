@@ -134,11 +134,13 @@ swept-path-checker/
 │  ├─ geometry.py         차체/바퀴 좌표 계산
 │  ├─ simulate.py         경로 추종 주행 시뮬레이션 (전진/후진/세미트레일러)
 │  ├─ analysis.py         충돌 검사, 궤적 계산, 판정
-│  ├─ drawing.py          DXF/DWG 읽기, 레이어·단위 처리
+│  ├─ drawing.py          DXF/DWG 읽기, 레이어·단위 처리 (블록은 한 번만 풀어 재사용)
+│  ├─ render.py           도면을 이미지 한 장으로 그리기 (보이는 선만, 확대·이동 미리보기)
 │  └─ export.py           DXF/보고서/작업 파일 저장
 ├─ selftest.py            실행 파일 자체 점검 (--selftest)
 ├─ SweptPathChecker.spec  PyInstaller 빌드 설정
 ├─ packaging/             exe와 함께 배포하는 사용법
+├─ tools/bench_view.py    화면 반응 속도 측정 (python tools/bench_view.py [도면.dxf])
 ├─ samples/               샘플 도면 및 생성 스크립트
 └─ tests/                 자동 테스트 (python -m pytest)
 ```

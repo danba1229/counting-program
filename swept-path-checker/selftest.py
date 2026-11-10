@@ -117,8 +117,14 @@ def run_selftest(sample: Path, out_dir: Path, app_class) -> int:
         try:
             gui = app_class(root)
             root.update()
-            gui.open_drawing(str(sample))
-            assert gui.drawing is not None
+            gui.open_drawing(str(sample))  # 백그라운드 읽기
+            deadline = time.time() + 30
+            while gui.drawing is None and time.time() < deadline:
+                root.update()
+                time.sleep(0.02)
+            assert gui.drawing is not None, "도면을 30초 안에 읽지 못함"
+            root.update()
+            assert gui.canvas.find_withtag("dwgimg"), "도면 이미지가 그려지지 않음"
             gui.vehicle_var.set(vehicles["large"].name)
             gui._on_vehicle_change()
             gui.start = (18.0, 3.5, 0.0)
@@ -133,9 +139,19 @@ def run_selftest(sample: Path, out_dir: Path, app_class) -> int:
             assert gui.analysis is not None, "검토 결과가 30초 안에 나오지 않음"
             verdict = gui.verdict_label.cget("text").strip()
             assert verdict == "회전 불가", verdict
-            items = len(gui.canvas.find_all())
-            assert items > 50, items
-            return f"화면 판정 '{verdict}', 그림 요소 {items}개"
+            root.update()
+            items = len(gui.canvas.find_withtag("result"))
+            assert items > 10, f"결과 궤적 요소 {items}개"
+            assert gui.canvas.find_withtag("dwgimg"), "도면 이미지 없음"
+            # 확대·이동 후에도 도면 이미지가 다시 그려지는지
+            gui._zoom(300, 300, 1.5)
+            gui._pan_start(type("E", (), {"x": 100, "y": 100})())
+            gui._pan_move(type("E", (), {"x": 160, "y": 130})())
+            root.update()
+            time.sleep(0.2)
+            root.update()
+            assert gui._dwg_base is not None and gui._dwg_base[1] == (gui.s, gui.tx, gui.ty), "이동 후 다시 그리기 안 됨"
+            return f"화면 판정 '{verdict}', 결과 궤적 요소 {items}개, 확대·이동 후 다시 그리기 정상"
         finally:
             root.destroy()
 

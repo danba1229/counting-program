@@ -47,12 +47,42 @@ class Drawing:
     unit_guessed: bool = False
     skipped: dict[str, int] = field(default_factory=dict)
 
+    # 화면 그리기용 색인 (build_index 에서 생성)
+    verts: np.ndarray | None = None  # 모든 점을 이어붙인 (M,2)
+    offsets: np.ndarray | None = None  # 폴리라인 i 의 점 = verts[offsets[i]:offsets[i+1]]
+    bboxes: np.ndarray | None = None  # (N,4) xmin, ymin, xmax, ymax (도면 단위)
+    layer_index: np.ndarray | None = None  # (N,) layer_names 위치
+    layer_names: list[str] = field(default_factory=list)
+
+    def build_index(self) -> None:
+        self.layer_names = sorted(self.layer_counts)
+        pos = {name: i for i, name in enumerate(self.layer_names)}
+        n = len(self.polylines)
+        lengths = np.array([len(p) for p in self.polylines], dtype=np.int64)
+        self.offsets = np.concatenate([[0], np.cumsum(lengths)]) if n else np.zeros(1, dtype=np.int64)
+        self.verts = np.concatenate(self.polylines) if n else np.zeros((0, 2))
+        if n:
+            idx = np.repeat(np.arange(n), lengths)
+            lo_x = np.full(n, np.inf)
+            lo_y = np.full(n, np.inf)
+            hi_x = np.full(n, -np.inf)
+            hi_y = np.full(n, -np.inf)
+            np.minimum.at(lo_x, idx, self.verts[:, 0])
+            np.minimum.at(lo_y, idx, self.verts[:, 1])
+            np.maximum.at(hi_x, idx, self.verts[:, 0])
+            np.maximum.at(hi_y, idx, self.verts[:, 1])
+            self.bboxes = np.stack([lo_x, lo_y, hi_x, hi_y], axis=1)
+        else:
+            self.bboxes = np.zeros((0, 4))
+        self.layer_index = np.array([pos[name] for name in self.layers], dtype=np.int32)
+
     def bounds_m(self) -> tuple[float, float, float, float] | None:
         if not self.polylines:
             return None
-        allpts = np.concatenate(self.polylines)
-        lo = allpts.min(axis=0) * self.unit_scale
-        hi = allpts.max(axis=0) * self.unit_scale
+        if self.bboxes is None:
+            self.build_index()
+        lo = self.bboxes[:, :2].min(axis=0) * self.unit_scale
+        hi = self.bboxes[:, 2:].max(axis=0) * self.unit_scale
         return float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1])
 
     def default_obstacle_layers(self) -> set[str]:
@@ -97,8 +127,14 @@ def read_document(path: Path):
         raise DrawingError(f"파일을 열 수 없습니다: {exc}") from exc
 
 
-def load_drawing(path: str | Path, flatten_tol_m: float = 0.02) -> Drawing:
+def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None) -> Drawing:
+    """도면을 읽어 선(폴리라인) 목록으로 만든다.
+
+    progress: 진행 상황 문자열을 받는 콜백 (백그라운드 스레드에서 호출될 수 있음)
+    """
     path = Path(path)
+    if progress:
+        progress("파일 해석 중...")
     doc = read_document(path)
     insunits = int(doc.header.get("$INSUNITS", 0) or 0)
     drawing = Drawing(path=path, insunits=insunits)
@@ -110,13 +146,18 @@ def load_drawing(path: str | Path, flatten_tol_m: float = 0.02) -> Drawing:
         scale = _guess_scale(msp)
         drawing.unit_guessed = True
     drawing.unit_scale = scale
-    tol = flatten_tol_m / scale
 
-    for entity in msp:
-        _collect(entity, None, drawing, tol, depth=0)
+    collector = _Collector(doc, drawing, flatten_tol_m / scale)
+    entities = list(msp)
+    n = len(entities)
+    for i, entity in enumerate(entities):
+        collector.add_top(entity)
+        if progress and i % 5000 == 0 and i:
+            progress(f"객체 변환 중... {i:,} / {n:,}")
     drawing.layer_counts = {}
     for layer in drawing.layers:
         drawing.layer_counts[layer] = drawing.layer_counts.get(layer, 0) + 1
+    drawing.build_index()
     return drawing
 
 
@@ -141,49 +182,110 @@ def _guess_scale(msp) -> float:
     return 0.001 if typical > 50 else 1.0
 
 
-def _collect(entity, parent_layer: str | None, drawing: Drawing, tol: float, depth: int) -> None:
-    from ezdxf import disassemble
+def _transform(pts: np.ndarray, m: np.ndarray) -> np.ndarray:
+    """ezdxf Matrix44(행 벡터 규약) 2D 변환."""
+    return pts @ m[:2, :2] + m[3, :2]
 
-    etype = entity.dxftype()
-    layer = entity.dxf.get("layer", "0")
-    if layer == "0" and parent_layer:
-        layer = parent_layer
-    if etype in SKIP_TYPES:
-        drawing.skipped[etype] = drawing.skipped.get(etype, 0) + 1
-        return
-    if etype == "INSERT":
-        if depth > 12:
-            return
+
+def _matrix(insert) -> np.ndarray:
+    mx = insert.matrix44()
+    return np.array([list(mx.get_row(i)) for i in range(4)], dtype=float)
+
+
+class _Collector:
+    """엔티티 → 폴리라인 변환. 블록은 한 번만 풀어 캐시하고 삽입마다 행렬만 적용한다."""
+
+    MAX_DEPTH = 12
+
+    def __init__(self, doc, drawing: Drawing, tol: float):
+        self.doc = doc
+        self.d = drawing
+        self.tol = tol
+        self.block_cache: dict[str, list[tuple[np.ndarray, str]]] = {}
+
+    def skip(self, key: str) -> None:
+        self.d.skipped[key] = self.d.skipped.get(key, 0) + 1
+
+    def add_top(self, entity) -> None:
+        for pts, layer in self.entity_geometry(entity, depth=0):
+            self.d.polylines.append(pts)
+            self.d.layers.append(layer)
+
+    def entity_geometry(self, entity, depth: int) -> list[tuple[np.ndarray, str]]:
+        """(폴리라인, 레이어) 목록. 레이어가 '0'이면 상위 삽입 레이어를 따른다."""
+        etype = entity.dxftype()
+        layer = entity.dxf.get("layer", "0")
+        if etype in SKIP_TYPES:
+            self.skip(etype)
+            return []
+        if etype == "INSERT":
+            return self.insert_geometry(entity, layer, depth)
+        return [(pts, layer) for pts in self.primitive(entity)]
+
+    def insert_geometry(self, insert, layer: str, depth: int) -> list[tuple[np.ndarray, str]]:
+        if depth > self.MAX_DEPTH:
+            return []
         try:
-            children = list(entity.virtual_entities())
+            inserts = list(insert.multi_insert()) if insert.mcount > 1 else [insert]
+            name = insert.dxf.name
+            geom = self.block_geometry(name, depth + 1)
+            out = []
+            for ins in inserts:
+                m = _matrix(ins)
+                for pts, lay in geom:
+                    out.append((_transform(pts, m), layer if lay == "0" else lay))
+            return out
         except Exception:
-            drawing.skipped["INSERT(오류)"] = drawing.skipped.get("INSERT(오류)", 0) + 1
-            return
-        for child in children:
-            _collect(child, layer, drawing, tol, depth + 1)
-        return
-    try:
-        prim = disassemble.make_primitive(entity, max_flattening_distance=tol)
-        if prim.is_empty:
-            return
-        if prim.path is not None:
-            for sub in prim.path.sub_paths():
-                pts = np.array([(p.x, p.y) for p in sub.flattening(tol)], dtype=float)
+            self.skip("INSERT(오류)")
+            return []
+
+    def block_geometry(self, name: str, depth: int) -> list[tuple[np.ndarray, str]]:
+        cached = self.block_cache.get(name)
+        if cached is not None:
+            return cached
+        self.block_cache[name] = []  # 자기 참조 블록 방지
+        block = self.doc.blocks.get(name)
+        out: list[tuple[np.ndarray, str]] = []
+        if block is not None:
+            for entity in block:
+                out.extend(self.entity_geometry(entity, depth))
+        self.block_cache[name] = out
+        return out
+
+    def primitive(self, entity) -> list[np.ndarray]:
+        from ezdxf import disassemble
+
+        etype = entity.dxftype()
+        try:
+            # 빠른 경로: 직선, 호가 없는 폴리선
+            if etype == "LINE":
+                s, e = entity.dxf.start, entity.dxf.end
+                if entity.dxf.extrusion.isclose((0, 0, 1)):
+                    return [np.array([[s.x, s.y], [e.x, e.y]], dtype=float)]
+            elif etype == "LWPOLYLINE" and not entity.has_arc and entity.dxf.extrusion.isclose((0, 0, 1)):
+                pts = np.array(entity.get_points("xy"), dtype=float)
                 if len(pts) >= 2:
-                    drawing.polylines.append(pts)
-                    drawing.layers.append(layer)
-            return
-        if prim.mesh is not None:
-            mesh = prim.mesh
-            verts = [(v.x, v.y) for v in mesh.vertices]
-            for face in mesh.faces:
-                pts = np.array([verts[i] for i in face] + [verts[face[0]]], dtype=float)
-                drawing.polylines.append(pts)
-                drawing.layers.append(layer)
-            return
-        pts = np.array([(v.x, v.y) for v in prim.vertices()], dtype=float)
-        if len(pts) >= 2:
-            drawing.polylines.append(pts)
-            drawing.layers.append(layer)
-    except Exception:
-        drawing.skipped[etype] = drawing.skipped.get(etype, 0) + 1
+                    if entity.closed:
+                        pts = np.vstack([pts, pts[:1]])
+                    return [pts]
+                return []
+            prim = disassemble.make_primitive(entity, max_flattening_distance=self.tol)
+            if prim.is_empty:
+                return []
+            if prim.path is not None:
+                out = []
+                for sub in prim.path.sub_paths():
+                    pts = np.array([(p.x, p.y) for p in sub.flattening(self.tol)], dtype=float)
+                    if len(pts) >= 2:
+                        out.append(pts)
+                return out
+            if prim.mesh is not None:
+                mesh = prim.mesh
+                verts = [(v.x, v.y) for v in mesh.vertices]
+                return [np.array([verts[i] for i in face] + [verts[face[0]]], dtype=float)
+                        for face in mesh.faces]
+            pts = np.array([(v.x, v.y) for v in prim.vertices()], dtype=float)
+            return [pts] if len(pts) >= 2 else []
+        except Exception:
+            self.skip(etype)
+            return []
