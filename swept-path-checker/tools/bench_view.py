@@ -73,6 +73,10 @@ def interact(root, pan, zoom) -> tuple[float, float]:
 
 
 def main() -> None:
+    try:  # 영문 Windows 콘솔(cp1252)에서도 한글 출력
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
     if len(sys.argv) > 1:
         dxf = Path(sys.argv[1])
     else:
