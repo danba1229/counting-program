@@ -256,3 +256,47 @@ def test_drawing_cache_roundtrip_and_invalidation(sample, tmp_path):
     os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 10_000_000_000))
     load_drawing(src, cache_dir=cache)
     assert len(list(cache.glob("*.npz"))) == 2
+
+
+def _total_length(d):
+    return sum(float(np.hypot(*np.diff(p, axis=0).T).sum()) for p in d.polylines)
+
+
+def test_real_drawing_regressions(tmp_path):
+    """실제 도면(이천송정)에서 발견된 문제 3가지 재현."""
+    import ezdxf
+
+    doc = ezdxf.new()
+    doc.header["$INSUNITS"] = 4
+    msp = doc.modelspace()
+    # 1) 두께가 있는 폴리선: 중심선이 아니라 띠의 테두리로 읽어야 함
+    msp.add_lwpolyline([(0, 0), (1000, 0)], dxfattribs={"const_width": 200, "layer": "두께"})
+    # 2) 작은 단위로 그린 블록을 크게 확대해 삽입: 원이 각지게 나오면 안 됨
+    blk = doc.blocks.new("작은원")
+    blk.add_circle((0, 0), 0.5, dxfattribs={"layer": "원"})
+    msp.add_blockref("작은원", (5000, 0), dxfattribs={"xscale": 1000, "yscale": 1000})
+    # 3) 길이 0 구간(곡선 포함)이 섞인 해치: 깨진 조각만 건너뛰고 경계는 살려야 함
+    blk2 = doc.blocks.new("해치")
+    h = blk2.add_hatch(dxfattribs={"layer": "해치경계"})
+    h.paths.add_polyline_path([(0.5, 0, -1), (0, 0, 1), (-0.5, 0, 1), (0.5, 0, -1)], is_closed=True)
+    msp.add_blockref("해치", (9000, 0), dxfattribs={"xscale": -200, "yscale": 200})
+    path = tmp_path / "regress.dxf"
+    doc.saveas(path)
+
+    d = load_drawing(path, use_cache=False)
+    by_layer = {}
+    for p, l in zip(d.polylines, d.layers):
+        by_layer.setdefault(l, []).append(p)
+    wide = np.concatenate(by_layer["두께"])
+    assert wide[:, 1].max() == pytest.approx(100, abs=1) and wide[:, 1].min() == pytest.approx(-100, abs=1)
+    circle = np.concatenate(by_layer["원"])
+    radii = np.hypot(circle[:, 0] - 5000, circle[:, 1])
+    assert radii.min() > 500 - 25  # 허용오차(20 mm) 안에서 매끈한 원
+    assert len(circle) > 16
+    hatch_len = sum(float(np.hypot(*np.diff(p, axis=0).T).sum()) for p in by_layer["해치경계"])
+    # 곡선을 허용오차(20 mm) 안에서 직선으로 나누므로 길이는 몇 % 짧을 수 있다
+    assert hatch_len == pytest.approx(math.pi * (0.25 + 0.25 + 0.5) * 200, rel=0.05)
+    pts = np.concatenate(by_layer["해치경계"])
+    # ezdxf 로 같은 블록(길이 0 구간 제외)을 변환한 기준값: x 8900~9100, y -100~50 (허용오차 20 mm)
+    assert pts[:, 0].min() == pytest.approx(8900, abs=1) and pts[:, 0].max() == pytest.approx(9100, abs=1)
+    assert pts[:, 1].min() == pytest.approx(-100, abs=21) and pts[:, 1].max() == pytest.approx(50, abs=21)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import math
 import json
 import os
 from pathlib import Path
@@ -33,7 +34,7 @@ SKIP_TYPES = {
 }
 
 # 변환 방식이 바뀌면 올려서 예전 캐시를 무효화한다.
-CACHE_VERSION = 1
+CACHE_VERSION = 4
 CACHE_KEEP = 20  # 캐시 파일 최대 개수 (오래된 것부터 삭제)
 
 # 기본으로 장애물에서 제외할 레이어 이름 패턴
@@ -337,34 +338,40 @@ class _Collector:
         self.doc = doc
         self.d = drawing
         self.tol = tol
-        self.block_cache: dict[str, list[tuple[np.ndarray, str]]] = {}
+        self.block_cache: dict[tuple[str, float], list[tuple[np.ndarray, str]]] = {}
 
     def skip(self, key: str) -> None:
         self.d.skipped[key] = self.d.skipped.get(key, 0) + 1
 
     def add_top(self, entity) -> None:
-        for pts, layer in self.entity_geometry(entity, depth=0):
+        for pts, layer in self.entity_geometry(entity, depth=0, tol=self.tol):
             self.d.polylines.append(pts)
             self.d.layers.append(layer)
 
-    def entity_geometry(self, entity, depth: int) -> list[tuple[np.ndarray, str]]:
-        """(폴리라인, 레이어) 목록. 레이어가 '0'이면 상위 삽입 레이어를 따른다."""
+    def entity_geometry(self, entity, depth: int, tol: float) -> list[tuple[np.ndarray, str]]:
+        """(폴리라인, 레이어) 목록. 레이어가 '0'이면 상위 삽입 레이어를 따른다.
+
+        tol: 이 좌표계에서의 곡선 분할 허용오차 (블록 안이면 삽입 배율만큼 작아진다)
+        """
         etype = entity.dxftype()
         layer = entity.dxf.get("layer", "0")
         if etype in SKIP_TYPES:
             self.skip(etype)
             return []
         if etype == "INSERT":
-            return self.insert_geometry(entity, layer, depth)
-        return [(pts, layer) for pts in self.primitive(entity)]
+            return self.insert_geometry(entity, layer, depth, tol)
+        return [(pts, layer) for pts in self.primitive(entity, tol)]
 
-    def insert_geometry(self, insert, layer: str, depth: int) -> list[tuple[np.ndarray, str]]:
+    def insert_geometry(self, insert, layer: str, depth: int, tol: float) -> list[tuple[np.ndarray, str]]:
         if depth > self.MAX_DEPTH:
             return []
         try:
             inserts = list(insert.multi_insert()) if insert.mcount > 1 else [insert]
             name = insert.dxf.name
-            geom = self.block_geometry(name, depth + 1)
+            # 블록을 크게 확대해 넣으면 블록 좌표에서는 더 촘촘히 나눠야 결과가 매끈하다.
+            scale = max(abs(insert.dxf.get("xscale", 1.0)), abs(insert.dxf.get("yscale", 1.0)), 1e-9)
+            child_tol = 2.0 ** math.floor(math.log2(tol / scale))
+            geom = self.block_geometry(name, depth + 1, child_tol)
             out = []
             for ins in inserts:
                 m = _matrix(ins)
@@ -375,20 +382,21 @@ class _Collector:
             self.skip("INSERT(오류)")
             return []
 
-    def block_geometry(self, name: str, depth: int) -> list[tuple[np.ndarray, str]]:
-        cached = self.block_cache.get(name)
+    def block_geometry(self, name: str, depth: int, tol: float) -> list[tuple[np.ndarray, str]]:
+        key = (name, tol)
+        cached = self.block_cache.get(key)
         if cached is not None:
             return cached
-        self.block_cache[name] = []  # 자기 참조 블록 방지
+        self.block_cache[key] = []  # 자기 참조 블록 방지
         block = self.doc.blocks.get(name)
         out: list[tuple[np.ndarray, str]] = []
         if block is not None:
             for entity in block:
-                out.extend(self.entity_geometry(entity, depth))
-        self.block_cache[name] = out
+                out.extend(self.entity_geometry(entity, depth, tol))
+        self.block_cache[key] = out
         return out
 
-    def primitive(self, entity) -> list[np.ndarray]:
+    def primitive(self, entity, tol: float) -> list[np.ndarray]:
         from ezdxf import disassemble
 
         etype = entity.dxftype()
@@ -398,20 +406,22 @@ class _Collector:
                 s, e = entity.dxf.start, entity.dxf.end
                 if entity.dxf.extrusion.isclose((0, 0, 1)):
                     return [np.array([[s.x, s.y], [e.x, e.y]], dtype=float)]
-            elif etype == "LWPOLYLINE" and not entity.has_arc and entity.dxf.extrusion.isclose((0, 0, 1)):
+            elif (etype == "LWPOLYLINE" and not entity.has_arc and not entity.has_width
+                  and entity.dxf.extrusion.isclose((0, 0, 1))):
+                # 두께(폭)가 있는 폴리선은 띠 모양 테두리로 읽어야 하므로 아래 일반 경로로 보낸다.
                 pts = np.array(entity.get_points("xy"), dtype=float)
                 if len(pts) >= 2:
                     if entity.closed:
                         pts = np.vstack([pts, pts[:1]])
                     return [pts]
                 return []
-            prim = disassemble.make_primitive(entity, max_flattening_distance=self.tol)
+            prim = disassemble.make_primitive(entity, max_flattening_distance=tol)
             if prim.is_empty:
                 return []
             if prim.path is not None:
                 out = []
                 for sub in prim.path.sub_paths():
-                    pts = np.array([(p.x, p.y) for p in sub.flattening(self.tol)], dtype=float)
+                    pts = np.array([(p.x, p.y) for p in sub.flattening(tol)], dtype=float)
                     if len(pts) >= 2:
                         out.append(pts)
                 return out
@@ -423,5 +433,94 @@ class _Collector:
             pts = np.array([(v.x, v.y) for v in prim.vertices()], dtype=float)
             return [pts] if len(pts) >= 2 else []
         except Exception:
+            if etype in ("HATCH", "MPOLYGON"):
+                pts_list = _hatch_boundaries(entity, tol)
+                if pts_list:
+                    return pts_list
             self.skip(etype)
             return []
+
+
+def _hatch_boundaries(hatch, tol: float) -> list[np.ndarray]:
+    """해치 경계를 직접 읽는다. 반지름 0인 호처럼 깨진 조각은 건너뛰고 나머지는 살린다."""
+    import math
+
+    from ezdxf.math import Vec3
+
+    out: list[np.ndarray] = []
+    try:
+        ocs = hatch.ocs()
+        elev = hatch.dxf.get("elevation", Vec3()).z
+    except Exception:
+        return out
+
+    def to_wcs(pts):
+        return [(v.x, v.y) for v in (ocs.to_wcs(Vec3(x, y, elev)) for x, y in pts)]
+
+    def arc_pts(cx, cy, r, a0, a1, ccw=True):
+        """해치 원호 조각 → 점 목록. 시계방향(ccw=False) 조각은 DXF 규약대로 각도 부호를 뒤집는다."""
+        if r <= 0:
+            return []
+        if ccw:
+            start, span = a0, (a1 - a0) % 360 or 360
+        else:
+            start, span = -a0, -((a1 - a0) % 360 or 360)
+        step = 2.0 * math.degrees(math.acos(max(1 - tol / r, -1.0))) if r > tol else 90.0
+        n = max(int(math.ceil(abs(span) / max(step, 1.0))), 2)
+        return [(cx + r * math.cos(math.radians(start + span * i / n)),
+                 cy + r * math.sin(math.radians(start + span * i / n))) for i in range(n + 1)]
+
+    for path in hatch.paths:
+        pts: list[tuple[float, float]] = []
+        try:
+            if path.type.name.startswith("Polyline") or hasattr(path, "vertices"):
+                from ezdxf.math import bulge_to_arc
+
+                verts = [(v[0], v[1], v[2] if len(v) > 2 else 0.0) for v in path.vertices]
+                if getattr(path, "is_closed", False) and verts:
+                    verts.append(verts[0])
+                for (x0, y0, bulge), (x1, y1, _b) in zip(verts, verts[1:]):
+                    if not pts:
+                        pts.append((x0, y0))
+                    if bulge and math.hypot(x1 - x0, y1 - y0) > 1e-9:
+                        try:
+                            c, a0, a1, r = bulge_to_arc((x0, y0), (x1, y1), bulge)
+                            arc = arc_pts(c[0], c[1], r, math.degrees(a0), math.degrees(a1), True)
+                            if arc and math.hypot(arc[0][0] - x0, arc[0][1] - y0) > r * 1e-3:
+                                arc = arc[::-1]  # 시계방향 bulge: 끝점에서 시작
+                            pts.extend(arc[1:] or [(x1, y1)])
+                            continue
+                        except Exception:
+                            pass  # 깨진 곡선 구간은 직선으로
+                    pts.append((x1, y1))
+            else:
+                for edge in path.edges:
+                    name = type(edge).__name__
+                    try:
+                        if name == "LineEdge":
+                            seg = [(edge.start[0], edge.start[1]), (edge.end[0], edge.end[1])]
+                        elif name == "ArcEdge":
+                            seg = arc_pts(edge.center[0], edge.center[1], edge.radius, edge.start_angle,
+                                          edge.end_angle, edge.ccw)
+                        elif name == "EllipseEdge":
+                            from ezdxf.math import ConstructionEllipse
+
+                            e = ConstructionEllipse(
+                                center=Vec3(edge.center[0], edge.center[1]),
+                                major_axis=Vec3(edge.major_axis[0], edge.major_axis[1]),
+                                ratio=edge.ratio, start_param=math.radians(edge.start_angle),
+                                end_param=math.radians(edge.end_angle), ccw=edge.ccw)
+                            seg = [(v.x, v.y) for v in e.flattening(tol)]
+                        elif name == "SplineEdge":
+                            ctrl = edge.fit_points or edge.control_points
+                            seg = [(v[0], v[1]) for v in ctrl]
+                        else:
+                            seg = []
+                    except Exception:
+                        seg = []  # 깨진 조각만 건너뜀
+                    pts.extend(seg)
+        except Exception:
+            continue
+        if len(pts) >= 2:
+            out.append(np.array(to_wcs(pts), dtype=float))
+    return out
