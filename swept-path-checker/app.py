@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+import multiprocessing
 from pathlib import Path
 import queue
 import sys
@@ -25,7 +26,9 @@ from PIL import ImageTk
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from swept_path.analysis import Analysis, CheckOptions, analyze, build_obstacles  # noqa: E402
-from swept_path.drawing import UNIT_CHOICES, Drawing, DrawingError, load_drawing  # noqa: E402
+from swept_path.drawing import (  # noqa: E402
+    UNIT_CHOICES, Drawing, DrawingError, cached_drawing, load_drawing, read_npz, subprocess_load_worker,
+)
 from swept_path.export import (  # noqa: E402
     export_dxf, export_report, load_project, save_project, scenario_from_dict, scenario_to_dict,
 )
@@ -54,6 +57,9 @@ COLOR_WHEEL = "#00a040"
 COLOR_CORNER = "#ff9a00"
 COLOR_SNAP = "#888888"
 COLOR_COLLISION = "#ff0000"
+
+SUBPROCESS_LOAD_MB = 8.0  # 이보다 큰 파일은 별도 프로세스에서 해석
+ASYNC_RENDER_LINES = 30000  # 화면에 보이는 선이 이보다 많으면 백그라운드에서 그림
 
 TOOL_START, TOOL_WAYPOINT, TOOL_DEST, TOOL_PAN = "start", "waypoint", "dest", "pan"
 
@@ -113,6 +119,9 @@ class SweptPathApp:
         self._dwg_photo = None
         self._dwg_base = None  # (PIL 이미지, (s, tx, ty))
         self._render_job = None
+        self._render_thread: threading.Thread | None = None
+        self._render_pending = False
+        self._render_q: queue.Queue = queue.Queue()
 
         self._build_ui()
         self._refresh_vehicle_list()
@@ -452,15 +461,25 @@ class SweptPathApp:
 
         self._loading = True
         self.root.config(cursor="watch")
-        q: queue.Queue = queue.Queue()
+        size_mb = Path(path).stat().st_size / 1e6 if Path(path).exists() else 0
+        use_process = size_mb >= SUBPROCESS_LOAD_MB and cached_drawing(path) is None
+        if use_process:
+            # 큰 파일은 별도 프로세스에서 해석 (화면이 멈추지 않고, 해석용 메모리도 그쪽에서만 사용)
+            ctx = multiprocessing.get_context("spawn")
+            q = ctx.Queue()
+            proc = ctx.Process(target=subprocess_load_worker, args=(str(path), q), daemon=True)
+            proc.start()
+        else:
+            q = queue.Queue()
+            proc = None
 
-        def work():
-            try:
-                d = load_drawing(path, progress=lambda msg: q.put(("progress", msg)))
-                q.put(("ok", d))
-            except Exception as exc:
-                traceback.print_exc()
-                q.put(("error", exc))
+            def work():
+                try:
+                    d = load_drawing(path, progress=lambda msg: q.put(("progress", msg)))
+                    q.put(("ok", d))
+                except Exception as exc:
+                    traceback.print_exc()
+                    q.put(("error", exc))
 
         last = {"msg": "도면 읽는 중..."}
 
@@ -471,6 +490,16 @@ class SweptPathApp:
                     if kind == "progress":
                         last["msg"] = payload
                         continue
+                    if kind == "ok" and proc is not None:
+                        npz, is_temp = payload
+                        payload = read_npz(npz, path)
+                        if is_temp:
+                            Path(npz).unlink(missing_ok=True)
+                        if payload is None:
+                            kind, payload = "error", RuntimeError("변환 결과를 읽지 못했습니다.")
+                    elif kind == "error" and proc is not None:
+                        name, msg = payload
+                        payload = DrawingError(msg) if name == "DrawingError" else RuntimeError(f"{name}: {msg}")
                     self._loading = False
                     self.root.config(cursor="")
                     if kind == "ok":
@@ -480,10 +509,16 @@ class SweptPathApp:
                     return
             except queue.Empty:
                 pass
+            if proc is not None and not proc.is_alive() and q.empty():
+                self._loading = False
+                self.root.config(cursor="")
+                self._on_drawing_error(RuntimeError(f"도면 변환 프로세스가 비정상 종료되었습니다 (코드 {proc.exitcode})."))
+                return
             self.set_status(f"{Path(path).name}: {last['msg']} ({time.time() - t0:.0f}초)")
             self.root.after(100, poll)
 
-        threading.Thread(target=work, daemon=True).start()
+        if proc is None:
+            threading.Thread(target=work, daemon=True).start()
         self.set_status(f"{Path(path).name}: 도면 읽는 중...")
         self.root.after(100, poll)
 
@@ -578,9 +613,46 @@ class SweptPathApp:
             self._dwg_photo = None
             return
         w, h = max(c.winfo_width(), 1), max(c.winfo_height(), 1)
-        img = self.renderer.render(w, h, self.s, self.tx, self.ty, self.obstacle_layers)
-        self._dwg_base = (img, (self.s, self.tx, self.ty))
-        self._show_image(img)
+        view = (self.s, self.tx, self.ty)
+        if self.renderer.visible_count(w, h, *view) < ASYNC_RENDER_LINES:
+            img = self.renderer.render(w, h, *view, self.obstacle_layers)
+            self._dwg_base = (img, view)
+            self._show_image(img)
+            return
+        # 큰 도면: 백그라운드에서 그리고, 그동안 화면 조작은 막지 않는다.
+        if self._render_thread is not None and self._render_thread.is_alive():
+            self._render_pending = True
+            return
+        self._render_pending = False
+        renderer, layers, size = self.renderer, set(self.obstacle_layers), (w, h)
+
+        def work():
+            img = renderer.render(size[0], size[1], *view, layers)
+            self._render_q.put((renderer, view, size, img))
+
+        self._render_thread = threading.Thread(target=work, daemon=True)
+        self._render_thread.start()
+        self.root.after(15, self._poll_render)
+
+    def _poll_render(self) -> None:
+        try:
+            renderer, view, size, img = self._render_q.get_nowait()
+        except queue.Empty:
+            self.root.after(15, self._poll_render)
+            return
+        if renderer is not self.renderer:
+            return  # 그사이 다른 도면을 열었음
+        c = self.canvas
+        cur_size = (max(c.winfo_width(), 1), max(c.winfo_height(), 1))
+        self._dwg_base = (img, view)
+        current = (self.s, self.tx, self.ty)
+        if view == current and size == cur_size and not self._render_pending:
+            self._show_image(img)
+            return
+        # 그리는 동안 화면이 바뀌었으면 받은 이미지를 맞춰 보여주고 다시 그린다.
+        self._show_image(preview_transform(img, view, current, cur_size))
+        self._render_pending = False
+        self.render_drawing()
 
     def _show_image(self, img) -> None:
         c = self.canvas
@@ -1180,6 +1252,7 @@ class VehicleDialog(tk.Toplevel):
 
 
 def main() -> None:
+    multiprocessing.freeze_support()  # 실행 파일(exe)에서 별도 프로세스 사용
     if "--selftest" in sys.argv:
         from selftest import run_selftest
 

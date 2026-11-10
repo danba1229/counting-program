@@ -165,6 +165,38 @@ def run_selftest(sample: Path, out_dir: Path, app_class) -> int:
         check("DXF·보고서 저장", t_export)
     check("GUI 실행 및 검토", t_gui)
 
+    def t_subprocess_load():
+        """큰 파일용 별도 프로세스 해석 경로 (임계값을 0으로 낮춰 샘플로 시험)."""
+        import shutil
+        import tkinter as tk
+
+        mod = sys.modules[app_class.__module__]
+        tmp = Path(tempfile.mkdtemp())
+        copy = tmp / "sub.dxf"
+        shutil.copy(sample, copy)  # 캐시가 없는 새 파일
+        old = mod.SUBPROCESS_LOAD_MB
+        mod.SUBPROCESS_LOAD_MB = 0.0
+        root = tk.Tk()
+        try:
+            gui = app_class(root)
+            t0 = time.time()
+            gui.open_drawing(str(copy))
+            while gui.drawing is None and gui._loading and time.time() - t0 < 60:
+                root.update()
+                time.sleep(0.02)
+            assert gui.drawing is not None, "별도 프로세스 해석 실패: " + gui.status.get()
+            assert len(gui.drawing.polylines) == len(state["drawing"].polylines)
+            # 두 번째는 캐시에서
+            from swept_path.drawing import cached_drawing
+            assert cached_drawing(copy) is not None, "캐시가 저장되지 않음"
+            return f"{time.time() - t0:.1f}초, 캐시 저장 확인"
+        finally:
+            mod.SUBPROCESS_LOAD_MB = old
+            root.destroy()
+
+    if "drawing" in state:
+        check("큰 파일 별도 프로세스 해석 + 캐시", t_subprocess_load)
+
     log("")
     log("결과: " + ("모두 통과" if failures == 0 else f"{failures}개 실패"))
     try:

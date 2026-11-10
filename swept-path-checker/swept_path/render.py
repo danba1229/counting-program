@@ -14,6 +14,7 @@ from .drawing import Drawing
 COLOR_BG = (255, 255, 255)
 COLOR_OBSTACLE = (32, 32, 32)
 COLOR_OTHER = (200, 200, 200)
+CHUNK = 20000  # 한 번에 처리할 폴리라인 수
 
 
 class DrawingRenderer:
@@ -21,6 +22,19 @@ class DrawingRenderer:
         self.d = drawing
         if drawing.bboxes is None:
             drawing.build_index()
+
+    def _visible(self, width, height, s, tx, ty) -> np.ndarray:
+        d = self.d
+        k = s * d.unit_scale
+        vx0, vx1 = (-2 - tx) / k, (width + 2 - tx) / k
+        vy0, vy1 = (ty - height - 2) / k, (ty + 2) / k
+        bb = d.bboxes
+        return (bb[:, 2] >= vx0) & (bb[:, 0] <= vx1) & (bb[:, 3] >= vy0) & (bb[:, 1] <= vy1)
+
+    def visible_count(self, width: int, height: int, s: float, tx: float, ty: float) -> int:
+        if self.d.bboxes is None or len(self.d.bboxes) == 0:
+            return 0
+        return int(np.count_nonzero(self._visible(width, height, s, tx, ty)))
 
     def render(self, width: int, height: int, s: float, tx: float, ty: float,
                obstacle_layers: set[str]) -> Image.Image:
@@ -31,12 +45,8 @@ class DrawingRenderer:
         if d.verts is None or len(d.verts) == 0:
             return img
         k = s * d.unit_scale  # 도면 단위 → 화면 px
-        # 화면에 보이는 영역 (도면 단위)
-        vx0, vx1 = (-2 - tx) / k, (width + 2 - tx) / k
-        vy0, vy1 = (ty - height - 2) / k, (ty + 2) / k
         bb = d.bboxes
-        visible = (bb[:, 2] >= vx0) & (bb[:, 0] <= vx1) & (bb[:, 3] >= vy0) & (bb[:, 1] <= vy1)
-        idx = np.nonzero(visible)[0]
+        idx = np.nonzero(self._visible(width, height, s, tx, ty))[0]
         if len(idx) == 0:
             return img
 
@@ -51,7 +61,15 @@ class DrawingRenderer:
         starts = offsets[idx]
         ends = offsets[idx + 1]
 
-        def draw_group(sel: np.ndarray, color) -> None:
+        def draw_group(sel_all: np.ndarray, color) -> None:
+            # 백그라운드에서 그릴 때 화면이 끊기지 않도록 조금씩 나눠 처리한다.
+            ids = np.nonzero(sel_all)[0]
+            for c0 in range(0, len(ids), CHUNK):
+                sel = np.zeros(len(sel_all), bool)
+                sel[ids[c0:c0 + CHUNK]] = True
+                draw_chunk(sel, color)
+
+        def draw_chunk(sel: np.ndarray, color) -> None:
             if not sel.any():
                 return
             g_starts, g_ends = starts[sel], ends[sel]

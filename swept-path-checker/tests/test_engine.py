@@ -235,3 +235,24 @@ def test_renderer_draws_visible_lines_only(sample):
     # 미리보기: 오른쪽으로 30px 이동한 변환이면 이미지도 30px 이동
     moved = np.asarray(preview_transform(img, (s, tx, ty), (s, tx + 30, ty), (900, 800)))
     assert (moved[:, 130:600] == arr[:, 100:570]).all()
+
+
+def test_drawing_cache_roundtrip_and_invalidation(sample, tmp_path):
+    import os
+    import shutil
+
+    src = tmp_path / "c.dxf"
+    shutil.copy(sample, src)
+    cache = tmp_path / "cachedir"
+    a = load_drawing(src, cache_dir=cache)
+    assert len(list(cache.glob("*.npz"))) == 1
+    b = load_drawing(src, cache_dir=cache)  # 캐시에서
+    assert b.layers == a.layers and b.layer_names == a.layer_names
+    assert all(np.array_equal(p, q) for p, q in zip(a.polylines, b.polylines))
+    assert np.array_equal(a.bboxes, b.bboxes)
+    assert b.default_obstacle_layers() == a.default_obstacle_layers()
+    # 파일이 바뀌면 다시 변환 (새 캐시 생성)
+    st = src.stat()
+    os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 10_000_000_000))
+    load_drawing(src, cache_dir=cache)
+    assert len(list(cache.glob("*.npz"))) == 2

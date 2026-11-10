@@ -7,8 +7,12 @@ DXF는 ezdxf로 직접 읽는다. DWG는 형식이 공개되어 있지 않아 �
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
+import os
 from pathlib import Path
 import re
+import sys
 
 import numpy as np
 
@@ -27,6 +31,10 @@ SKIP_TYPES = {
     "MULTILEADER", "POINT", "IMAGE", "VIEWPORT", "WIPEOUT", "TOLERANCE", "XLINE", "RAY",
     "OLE2FRAME", "UNDERLAY", "PDFUNDERLAY", "DWFUNDERLAY", "DGNUNDERLAY",
 }
+
+# 변환 방식이 바뀌면 올려서 예전 캐시를 무효화한다.
+CACHE_VERSION = 1
+CACHE_KEEP = 20  # 캐시 파일 최대 개수 (오래된 것부터 삭제)
 
 # 기본으로 장애물에서 제외할 레이어 이름 패턴
 NON_OBSTACLE_PATTERN = re.compile(
@@ -75,6 +83,8 @@ class Drawing:
         else:
             self.bboxes = np.zeros((0, 4))
         self.layer_index = np.array([pos[name] for name in self.layers], dtype=np.int32)
+        # 개별 폴리라인은 verts 의 뷰로 바꿔 메모리 중복을 없앤다.
+        self.polylines = np.split(self.verts, self.offsets[1:-1]) if n else []
 
     def bounds_m(self) -> tuple[float, float, float, float] | None:
         if not self.polylines:
@@ -127,12 +137,24 @@ def read_document(path: Path):
         raise DrawingError(f"파일을 열 수 없습니다: {exc}") from exc
 
 
-def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None) -> Drawing:
+def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None,
+                 use_cache: bool = True, cache_dir: Path | None = None) -> Drawing:
     """도면을 읽어 선(폴리라인) 목록으로 만든다.
 
     progress: 진행 상황 문자열을 받는 콜백 (백그라운드 스레드에서 호출될 수 있음)
+    use_cache: 한 번 변환한 도면을 캐시 파일로 저장해 다음에는 바로 연다.
+               (파일 크기·수정 시각이 바뀌면 다시 변환)
     """
     path = Path(path)
+    cache_file = None
+    if use_cache:
+        cache_file = _cache_path(path, flatten_tol_m, cache_dir)
+        if cache_file is not None and cache_file.exists():
+            if progress:
+                progress("저장된 변환 결과(캐시) 불러오는 중...")
+            cached = _read_cache(cache_file, path)
+            if cached is not None:
+                return cached
     if progress:
         progress("파일 해석 중...")
     doc = read_document(path)
@@ -158,7 +180,121 @@ def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None) -
     for layer in drawing.layers:
         drawing.layer_counts[layer] = drawing.layer_counts.get(layer, 0) + 1
     drawing.build_index()
+    if cache_file is not None:
+        if progress:
+            progress("변환 결과 저장 중 (다음에는 빠르게 열림)...")
+        _write_cache(cache_file, drawing)
     return drawing
+
+
+# ----------------------------------------------------------------------
+# 변환 결과 캐시
+# ----------------------------------------------------------------------
+def default_cache_dir() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "SweptPathChecker" / "drawings"
+
+
+def _cache_path(path: Path, tol: float, cache_dir: Path | None) -> Path | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}|{tol}|{CACHE_VERSION}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
+    return (cache_dir or default_cache_dir()) / f"{digest}.npz"
+
+
+def _write_cache(cache_file: Path, d: Drawing) -> None:
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "path": str(d.path), "insunits": d.insunits, "unit_scale": d.unit_scale,
+            "unit_guessed": d.unit_guessed, "skipped": d.skipped, "layer_names": d.layer_names,
+            "layer_counts": d.layer_counts, "version": CACHE_VERSION,
+        }
+        tmp = cache_file.with_suffix(".tmp.npz")
+        np.savez(tmp, verts=d.verts, offsets=d.offsets, layer_index=d.layer_index,
+                 meta=np.frombuffer(json.dumps(meta, ensure_ascii=False).encode("utf-8"), dtype=np.uint8))
+        os.replace(tmp, cache_file)
+        files = sorted(cache_file.parent.glob("*.npz"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for old in files[CACHE_KEEP:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass  # 캐시는 있으면 좋은 것일 뿐, 실패해도 도면 열기에는 지장 없음
+
+
+def cached_drawing(path: str | Path, flatten_tol_m: float = 0.02,
+                   cache_dir: Path | None = None) -> Drawing | None:
+    """캐시가 있으면 바로 읽어 반환, 없으면 None."""
+    path = Path(path)
+    cache_file = _cache_path(path, flatten_tol_m, cache_dir)
+    if cache_file is None or not cache_file.exists():
+        return None
+    return _read_cache(cache_file, path)
+
+
+def subprocess_load_worker(path: str, queue, cache_dir: str | None = None) -> None:
+    """별도 프로세스에서 도면을 변환해 캐시 파일(npz)로 저장하고 그 경로를 돌려준다.
+
+    해석 중 GIL 을 오래 잡는 작업이 있어도 화면(메인 프로세스)이 멈추지 않는다.
+    """
+    import tempfile
+
+    try:
+        cdir = Path(cache_dir) if cache_dir else None
+        d = load_drawing(path, progress=lambda m: queue.put(("progress", m)), cache_dir=cdir)
+        cache_file = _cache_path(Path(path), 0.02, cdir)
+        if cache_file is None or not cache_file.exists():
+            # 캐시 폴더에 쓸 수 없으면 임시 파일로 전달
+            cache_file = Path(tempfile.mkdtemp()) / "drawing.npz"
+            _write_cache(cache_file, d)
+            queue.put(("ok", (str(cache_file), True)))
+        else:
+            queue.put(("ok", (str(cache_file), False)))
+    except DrawingError as exc:
+        queue.put(("error", ("DrawingError", str(exc))))
+    except Exception as exc:  # pragma: no cover
+        queue.put(("error", (type(exc).__name__, str(exc))))
+
+
+def read_npz(cache_file: str | Path, path: str | Path) -> Drawing | None:
+    return _read_cache(Path(cache_file), Path(path))
+
+
+def _read_cache(cache_file: Path, path: Path) -> Drawing | None:
+    try:
+        with np.load(cache_file) as z:
+            meta = json.loads(bytes(z["meta"]).decode("utf-8"))
+            if meta.get("version") != CACHE_VERSION:
+                return None
+            d = Drawing(path=path, insunits=meta["insunits"], unit_scale=meta["unit_scale"],
+                        unit_guessed=meta["unit_guessed"], skipped=meta["skipped"])
+            d.verts = z["verts"]
+            d.offsets = z["offsets"]
+            d.layer_index = z["layer_index"]
+        d.layer_names = meta["layer_names"]
+        d.layer_counts = meta["layer_counts"]
+        d.layers = [d.layer_names[i] for i in d.layer_index.tolist()]
+        n = len(d.layer_index)
+        lengths = np.diff(d.offsets)
+        idx = np.repeat(np.arange(n), lengths)
+        bb = np.empty((n, 4))
+        for col, (fn, axis) in enumerate(((np.minimum, 0), (np.minimum, 1), (np.maximum, 0), (np.maximum, 1))):
+            bb[:, col] = np.inf if fn is np.minimum else -np.inf
+            fn.at(bb[:, col], idx, d.verts[:, axis])
+        d.bboxes = bb
+        d.polylines = np.split(d.verts, d.offsets[1:-1]) if n else []
+        try:
+            os.utime(cache_file)  # 최근 사용 표시 (오래된 캐시부터 지움)
+        except OSError:
+            pass
+        return d
+    except Exception:
+        return None
 
 
 def _guess_scale(msp) -> float:
