@@ -1,0 +1,125 @@
+"""경로 수정 기능 GUI 테스트 (화면이 없으면 건너뜀)."""
+
+import math
+from pathlib import Path
+import sys
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+tk = pytest.importorskip("tkinter")
+
+
+class E:
+    def __init__(self, x, y, state=0):
+        self.x, self.y, self.state = x, y, state
+
+
+@pytest.fixture()
+def gui():
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("화면(display) 없음")
+    root.geometry("1200x800+0+0")
+    import app as appmod
+
+    a = appmod.SweptPathApp(root)
+    root.update()
+    a.s, a.tx, a.ty = 10.0, 100.0, 500.0  # 1 m = 10 px
+    yield a, appmod
+    root.destroy()
+
+
+def click(a, x, y):
+    a._on_press(E(x, y))
+    a._on_release(E(x, y))
+
+
+def drag(a, x0, y0, x1, y1, state=0):
+    a._on_press(E(x0, y0, state))
+    a._on_drag(E((x0 + x1) / 2, (y0 + y1) / 2, state))
+    a._on_drag(E(x1, y1, state))
+    a._on_release(E(x1, y1, state))
+
+
+def make_path(a, appmod):
+    a.tool_var.set(appmod.TOOL_START)
+    drag(a, *a.w2c(0, 0), *a.w2c(5, 0))  # 출발 (0,0) 동쪽
+    a.tool_var.set(appmod.TOOL_WAYPOINT)
+    click(a, *a.w2c(20, 0))
+    click(a, *a.w2c(30, 10))
+    a.tool_var.set(appmod.TOOL_DEST)
+    drag(a, *a.w2c(30, 30), *a.w2c(30, 35))  # 목적지 북쪽
+
+
+def test_move_point_by_drag_and_undo(gui):
+    a, appmod = gui
+    make_path(a, appmod)
+    assert len(a.waypoints) == 2 and a.dest is not None
+    a.tool_var.set(appmod.TOOL_WAYPOINT)  # 경유점 도구여도 점 위를 누르면 새 점 대신 이동
+    drag(a, *a.w2c(20, 0), *a.w2c(22, 4))
+    assert len(a.waypoints) == 2
+    assert (a.waypoints[0].x, a.waypoints[0].y) == pytest.approx((22, 4), abs=0.05)
+    a.undo()
+    assert (a.waypoints[0].x, a.waypoints[0].y) == pytest.approx((20, 0), abs=0.05)
+
+
+def test_move_start_and_rotate_heading(gui):
+    a, appmod = gui
+    make_path(a, appmod)
+    drag(a, *a.w2c(0, 0), *a.w2c(-3, 1))  # 출발점 이동
+    assert a.start[:2] == pytest.approx((-3, 1), abs=0.05)
+    assert a.start[2] == pytest.approx(0.0, abs=1e-6)  # 방향 유지
+    L = a._arrow_len()
+    tip = a.w2c(-3 + L, 1)
+    drag(a, *tip, *a.w2c(-3, 1 + L))  # 화살표 끝을 끌어 북쪽으로
+    assert math.degrees(a.start[2]) == pytest.approx(90, abs=1)
+    # 목적지 방향도 화살표 끝으로 수정, Shift 는 15° 단위
+    dx, dy = a.dest.x, a.dest.y
+    tip = a.w2c(dx + L * math.cos(a.dest.heading), dy + L * math.sin(a.dest.heading))
+    drag(a, *tip, *a.w2c(dx + L, dy + L * 0.3), state=0x0001)
+    deg = math.degrees(a.dest.heading)
+    assert deg == pytest.approx(round(deg / 15) * 15, abs=1e-6)
+    assert round(deg / 15) * 15 == 15  # (L, 0.3L) 방향 ≈ 16.7° → 15°
+
+
+def test_click_without_move_does_not_create_undo_step(gui):
+    a, appmod = gui
+    make_path(a, appmod)
+    n = len(a._undo)
+    click(a, *a.w2c(20, 0))  # 점 위를 누르기만 함 → 선택만
+    assert len(a._undo) == n and len(a.waypoints) == 2
+    assert a._selected_point() == ("wp", 0)
+
+
+def test_reset_and_undo_reset(gui):
+    a, appmod = gui
+    make_path(a, appmod)
+    before = a._snapshot()
+    a.clear_path()
+    assert a.start is None and not a.waypoints and a.dest is None
+    a.undo()
+    assert a._snapshot() == before
+
+
+def test_numeric_edit(gui):
+    a, appmod = gui
+    make_path(a, appmod)
+    a.apply_point_values("wp", 1, 31.5, 12.25, None, appmod.REVERSE)
+    w = a.waypoints[1]
+    assert (w.x, w.y, w.gear) == (31.5, 12.25, appmod.REVERSE)
+    a.apply_point_values("dest", None, 30, 40, None, appmod.FORWARD)
+    assert a.dest.heading is None and (a.dest.x, a.dest.y) == (30, 40)
+    a.apply_point_values("start", None, 1, 2, 45, None)
+    assert a.start == pytest.approx((1, 2, math.radians(45)))
+    # 대화상자도 열리고 닫히는지
+    a._select_in_list("wp", 0)
+    a.edit_selected_point()
+    a.root.update()
+    dlg = [w for w in a.root.winfo_children() if isinstance(w, appmod.PointDialog)][0]
+    dlg.vx.set("21")
+    dlg._apply()
+    assert a.waypoints[0].x == 21

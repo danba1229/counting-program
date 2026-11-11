@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import multiprocessing
 from pathlib import Path
@@ -112,6 +113,8 @@ class SweptPathApp:
         self.tx = 100.0
         self.ty = 500.0
         self._drag = None
+        self._edit = None  # 점 이동/방향 수정 중: (종류, 번호, 모드, 잡은 위치 오프셋)
+        self._undo: list = []  # 경로 되돌리기 기록
         self._busy = False
         self._loading = False
         # 도면 이미지 렌더링 상태
@@ -177,6 +180,11 @@ class SweptPathApp:
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.verdict_label = tk.Label(self.canvas, text="", font=("", 14, "bold"), bg="white")
         self.verdict_label.place(x=10, y=8)
+        overlay = ttk.Frame(self.canvas)
+        overlay.place(relx=1.0, x=-10, y=8, anchor="ne")
+        ttk.Button(overlay, text="↶ 되돌리기", command=self.undo).pack(side=tk.LEFT)
+        ttk.Button(overlay, text="경로 초기화", command=self.clear_path).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(overlay, text="화면 맞춤", command=self.fit_view).pack(side=tk.LEFT, padx=(4, 0))
 
     # ---------------- 도면 탭 ----------------
     def _build_drawing_tab(self) -> None:
@@ -256,13 +264,22 @@ class SweptPathApp:
         ttk.Label(gear_frame, text="(전진↔후진이 바뀌는 점에서 정지 후 방향전환)",
                   foreground="#666").pack(side=tk.LEFT)
 
+        ttk.Label(tab, foreground="#666", wraplength=340, justify="left",
+                  text="찍은 점을 누른 채 끌면 위치 이동, 화살표 끝을 끌면 방향 수정. "
+                       "목록에서 더블클릭하면 숫자로 수정. Ctrl+Z: 되돌리기").pack(fill=tk.X)
         self.point_list = tk.Listbox(tab, height=4, exportselection=False)
         self.point_list.pack(fill=tk.BOTH, expand=True, pady=2)
+        self.point_list.bind("<Double-Button-1>", lambda e: self.edit_selected_point())
+        self.point_list.bind("<<ListboxSelect>>", lambda e: self.draw_path())
         pb = ttk.Frame(tab)
         pb.pack(fill=tk.X)
-        ttk.Button(pb, text="선택 점 삭제", command=self.delete_selected_point).pack(side=tk.LEFT)
-        ttk.Button(pb, text="선택 점 전진/후진 전환", command=self.toggle_selected_gear).pack(side=tk.LEFT, padx=4)
-        ttk.Button(pb, text="전체 초기화", command=self.clear_path).pack(side=tk.LEFT)
+        ttk.Button(pb, text="선택 점 수정", command=self.edit_selected_point).pack(side=tk.LEFT)
+        ttk.Button(pb, text="선택 점 삭제", command=self.delete_selected_point).pack(side=tk.LEFT, padx=4)
+        ttk.Button(pb, text="전진/후진 전환", command=self.toggle_selected_gear).pack(side=tk.LEFT)
+        pb2 = ttk.Frame(tab)
+        pb2.pack(fill=tk.X, pady=(2, 0))
+        ttk.Button(pb2, text="↶ 되돌리기 (Ctrl+Z)", command=self.undo).pack(side=tk.LEFT)
+        ttk.Button(pb2, text="경로 초기화", command=self.clear_path).pack(side=tk.LEFT, padx=4)
 
         opt = ttk.LabelFrame(tab, text="검토 조건", padding=4)
         opt.pack(fill=tk.X, pady=6)
@@ -347,6 +364,8 @@ class SweptPathApp:
         c.bind("<Configure>", lambda e: (self._update_hud(), self.schedule_render(preview=False)))
         self.root.bind("<Delete>", lambda e: self.delete_selected_point())
         self.root.bind("<Escape>", lambda e: self._cancel_drag())
+        self.root.bind("<Control-z>", lambda e: self.undo())
+        self.root.bind("<Control-Z>", lambda e: self.undo())
 
     def _zoom(self, cx, cy, f) -> None:
         self.canvas.scale("world", cx, cy, f, f)
@@ -372,6 +391,127 @@ class SweptPathApp:
         x, y = self.c2w(e.x, e.y)
         self.coord_var.set(f"x = {x:,.2f} m   y = {y:,.2f} m")
 
+    # ---------------- 점 수정 ----------------
+    HIT_PX = 9
+
+    def _arrow_len(self) -> float:
+        """방향 화살표 길이(m). 축소해도 화면에서 30 px 이상 되게 한다."""
+        return max(3.0, 30.0 / self.s)
+
+    def _point_xy(self, kind: str, idx) -> tuple[float, float]:
+        if kind == "start":
+            return self.start[0], self.start[1]
+        w = self.waypoints[idx] if kind == "wp" else self.dest
+        return w.x, w.y
+
+    def _point_heading(self, kind: str, idx):
+        if kind == "start":
+            return self.start[2]
+        if kind == "dest":
+            return self.dest.heading
+        return None
+
+    def _hit_point(self, cx: float, cy: float):
+        """화면 좌표 근처의 점 → (종류, 번호, 'move'|'rotate'). 없으면 None."""
+        cands = []
+        if self.start:
+            cands.append(("start", None))
+        cands += [("wp", i) for i in range(len(self.waypoints))]
+        if self.dest:
+            cands.append(("dest", None))
+        best = None
+        for kind, idx in cands:
+            x, y = self._point_xy(kind, idx)
+            px, py = self.w2c(x, y)
+            d = math.hypot(cx - px, cy - py)
+            if d <= self.HIT_PX and (best is None or d < best[0]):
+                best = (d, kind, idx, "move")
+            h = self._point_heading(kind, idx)
+            if h is not None:
+                L = self._arrow_len()
+                hx, hy = self.w2c(x + L * math.cos(h), y + L * math.sin(h))
+                d = math.hypot(cx - hx, cy - hy)
+                if d <= self.HIT_PX and (best is None or d < best[0]):
+                    best = (d, kind, idx, "rotate")
+        return None if best is None else best[1:]
+
+    def _apply_edit_drag(self, e) -> None:
+        if math.hypot(e.x - self._edit_press[0], e.y - self._edit_press[1]) < 3:
+            return  # 누르기만 했으면 그대로 둔다 (선택만)
+        kind, idx, mode, (ox, oy) = self._edit
+        if mode == "move":
+            x, y = self.c2w(e.x - ox, e.y - oy)
+            if kind == "start":
+                self.start = (x, y, self.start[2])
+            else:
+                w = self.waypoints[idx] if kind == "wp" else self.dest
+                w.x, w.y = x, y
+            self.coord_var.set(f"이동: x = {x:,.2f} m   y = {y:,.2f} m")
+        else:
+            px, py = self._point_xy(kind, idx)
+            wx, wy = self.c2w(e.x, e.y)
+            ang = self._snap_heading(math.atan2(wy - py, wx - px), e)
+            if kind == "start":
+                self.start = (self.start[0], self.start[1], ang)
+            else:
+                self.dest.heading = ang
+            self.coord_var.set(f"방향 {math.degrees(ang):.1f}°  (Shift: 15° 단위)")
+        self.clear_results()
+        self.draw_path()
+
+    def _list_index(self, kind: str, idx) -> int:
+        base = 1 if self.start else 0
+        if kind == "start":
+            return 0
+        if kind == "wp":
+            return base + idx
+        return base + len(self.waypoints)
+
+    def _select_in_list(self, kind: str, idx) -> None:
+        self.point_list.selection_clear(0, tk.END)
+        i = self._list_index(kind, idx)
+        self.point_list.selection_set(i)
+        self.point_list.see(i)
+
+    def _snapshot(self):
+        return copy.deepcopy((self.start, self.waypoints, self.dest))
+
+    def _push_undo(self) -> None:
+        self._undo.append(self._snapshot())
+        del self._undo[:-100]  # 최근 100단계까지
+
+    def undo(self) -> None:
+        if not self._undo:
+            self.set_status("되돌릴 작업이 없습니다.")
+            return
+        self.start, self.waypoints, self.dest = self._undo.pop()
+        self._path_changed()
+        self.set_status(f"되돌렸습니다. (남은 되돌리기 {len(self._undo)}단계)")
+
+    def edit_selected_point(self) -> None:
+        sel = self._selected_point()
+        if sel is None:
+            messagebox.showinfo("안내", "목록에서 수정할 점을 선택하세요.")
+            return
+        kind, idx = sel
+        PointDialog(self.root, self, kind, idx)
+
+    def apply_point_values(self, kind: str, idx, x: float, y: float, heading_deg, gear: int | None) -> None:
+        """숫자 입력으로 점 수정 (heading_deg 가 None 이면 방향 없음)."""
+        self._push_undo()
+        h = None if heading_deg is None else math.radians(heading_deg)
+        if kind == "start":
+            self.start = (x, y, h if h is not None else self.start[2])
+        else:
+            w = self.waypoints[idx] if kind == "wp" else self.dest
+            w.x, w.y = x, y
+            if gear is not None:
+                w.gear = gear
+            if kind == "dest":
+                w.heading = h
+        self._path_changed()
+        self._select_in_list(kind, idx)
+
     def _cancel_drag(self) -> None:
         self._drag = None
         self.canvas.delete("rubber")
@@ -387,11 +527,22 @@ class SweptPathApp:
         if tool == TOOL_PAN:
             self._pan_start(e)
             return
+        hit = self._hit_point(e.x, e.y)
+        if hit is not None:
+            # 이미 찍은 점(또는 방향 화살표 끝)을 누르면 새로 찍지 않고 수정한다.
+            kind, idx, mode = hit
+            px, py = self.w2c(*self._point_xy(kind, idx))
+            self._edit = (kind, idx, mode, (e.x - px, e.y - py))
+            self._edit_before = self._snapshot()  # 실제로 바뀌었을 때만 되돌리기에 기록
+            self._edit_press = (e.x, e.y)
+            self._select_in_list(kind, idx)
+            return
         x, y = self.c2w(e.x, e.y)
         if tool == TOOL_WAYPOINT:
             if self.start is None:
                 messagebox.showinfo("안내", "먼저 출발점을 지정하세요.")
                 return
+            self._push_undo()
             self.waypoints.append(Waypoint(x, y, self.gear_var.get()))
             self._path_changed()
             return
@@ -403,6 +554,9 @@ class SweptPathApp:
     def _on_drag(self, e) -> None:
         if self.tool_var.get() == TOOL_PAN:
             self._pan_move(e)
+            return
+        if self._edit:
+            self._apply_edit_drag(e)
             return
         if not self._drag:
             return
@@ -416,6 +570,17 @@ class SweptPathApp:
             self.coord_var.set(f"방향 {math.degrees(ang):.1f}°  (Shift: 15° 단위)")
 
     def _on_release(self, e) -> None:
+        if self._edit:
+            kind, idx = self._edit[0], self._edit[1]
+            self._apply_edit_drag(e)
+            self._edit = None
+            if self._snapshot() != self._edit_before:
+                self._undo.append(self._edit_before)
+                del self._undo[:-100]
+            self._path_changed()
+            self._select_in_list(kind, idx)
+            self.draw_path()
+            return
         if not self._drag:
             return
         tool, x, y, px, py = self._drag
@@ -425,6 +590,7 @@ class SweptPathApp:
         if math.hypot(e.x - px, e.y - py) > 8:
             wx, wy = self.c2w(e.x, e.y)
             heading = self._snap_heading(math.atan2(wy - y, wx - x), e)
+        self._push_undo()
         if tool == TOOL_START:
             if heading is None:
                 heading = self.start[2] if self.start else 0.0
@@ -846,6 +1012,9 @@ class SweptPathApp:
         return ("dest", None)
 
     def delete_selected_point(self) -> None:
+        if not self.start and not self._all_points():
+            return
+        self._push_undo()
         sel = self._selected_point()
         if sel is None:
             if self.dest:
@@ -867,11 +1036,15 @@ class SweptPathApp:
         sel = self._selected_point()
         if not sel or sel[0] == "start":
             return
+        self._push_undo()
         w = self.waypoints[sel[1]] if sel[0] == "wp" else self.dest
         w.gear = -w.gear
         self._path_changed()
 
     def clear_path(self) -> None:
+        if self.start or self._all_points():
+            self._push_undo()
+            self.set_status("경로를 초기화했습니다. (Ctrl+Z 로 되돌리기)")
         self.start = None
         self.waypoints = []
         self.dest = None
@@ -894,7 +1067,8 @@ class SweptPathApp:
         except Exception:
             pass
         cx, cy = self.w2c(sx, sy)
-        hx, hy = self.w2c(sx + 3 * math.cos(sh), sy + 3 * math.sin(sh))
+        L = self._arrow_len()
+        hx, hy = self.w2c(sx + L * math.cos(sh), sy + L * math.sin(sh))
         c.create_line(cx, cy, hx, hy, arrow=tk.LAST, width=2, fill="#0070ff", tags=tags)
         c.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill="#0070ff", outline="", tags=tags)
         c.create_text(cx + 8, cy - 12, text="출발", fill="#0070ff", anchor="w", tags=tags)
@@ -913,9 +1087,16 @@ class SweptPathApp:
             label = "목적지" if is_dest else (f"{i + 1} 전환" if cusp else str(i + 1))
             c.create_text(px + 8, py - 10, text=label, fill=color, anchor="w", tags=tags)
             if w.heading is not None:
-                ex, ey = self.w2c(w.x + 3 * math.cos(w.heading), w.y + 3 * math.sin(w.heading))
+                ex, ey = self.w2c(w.x + L * math.cos(w.heading), w.y + L * math.sin(w.heading))
                 c.create_line(px, py, ex, ey, arrow=tk.LAST, width=2, fill=color, tags=tags)
             prev = (w.x, w.y)
+        sel = self._selected_point() if self.point_list.curselection() else None
+        if sel is not None:
+            try:
+                px, py = self.w2c(*self._point_xy(*sel))
+                c.create_oval(px - 11, py - 11, px + 11, py + 11, outline="#ffb000", width=3, tags=tags)
+            except (IndexError, AttributeError, TypeError):
+                pass
         c.tag_raise("overlay")
 
     # ==================================================================
@@ -1179,6 +1360,67 @@ class SweptPathApp:
 
     def set_status(self, text: str) -> None:
         self.status.set(text)
+
+
+class PointDialog(tk.Toplevel):
+    """점 좌표·방향·진행방향 숫자 입력 수정."""
+
+    def __init__(self, master, app: "SweptPathApp", kind: str, idx):
+        super().__init__(master)
+        self.app, self.kind, self.idx = app, kind, idx
+        names = {"start": "출발점", "dest": "목적지"}
+        self.title(f"{names.get(kind, f'{idx + 1}번 경유점')} 수정")
+        self.resizable(False, False)
+        self.transient(master)
+        x, y = app._point_xy(kind, idx)
+        heading = app._point_heading(kind, idx)
+        frm = ttk.Frame(self, padding=10)
+        frm.pack()
+        self.vx = tk.StringVar(value=f"{x:.3f}")
+        self.vy = tk.StringVar(value=f"{y:.3f}")
+        self.vh = tk.StringVar(value="" if heading is None else f"{math.degrees(heading):.1f}")
+        ttk.Label(frm, text="x (m)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.vx, width=14).grid(row=0, column=1, pady=2)
+        ttk.Label(frm, text="y (m)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.vy, width=14).grid(row=1, column=1, pady=2)
+        row = 2
+        if kind in ("start", "dest"):
+            label = "차량 방향 (°, 동쪽=0, 반시계+)" + ("" if kind == "start" else "\n비우면 방향 지정 안 함")
+            ttk.Label(frm, text=label, justify="left").grid(row=row, column=0, sticky="w")
+            ttk.Entry(frm, textvariable=self.vh, width=14).grid(row=row, column=1, pady=2)
+            row += 1
+        self.vg = None
+        if kind != "start":
+            w = app.waypoints[idx] if kind == "wp" else app.dest
+            self.vg = tk.IntVar(value=w.gear)
+            gf = ttk.Frame(frm)
+            gf.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
+            ttk.Label(gf, text="이 점까지").pack(side=tk.LEFT)
+            ttk.Radiobutton(gf, text="전진", value=FORWARD, variable=self.vg).pack(side=tk.LEFT, padx=4)
+            ttk.Radiobutton(gf, text="후진", value=REVERSE, variable=self.vg).pack(side=tk.LEFT)
+            row += 1
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(btns, text="적용", command=self._apply).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="취소", command=self.destroy).pack(side=tk.LEFT)
+        self.bind("<Return>", lambda e: self._apply())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+
+    def _apply(self) -> None:
+        try:
+            x, y = float(self.vx.get()), float(self.vy.get())
+            raw = self.vh.get().strip()
+            heading = None if raw == "" else float(raw)
+        except ValueError:
+            messagebox.showerror("입력 오류", "숫자를 입력하세요.", parent=self)
+            return
+        if self.kind == "start" and heading is None:
+            messagebox.showerror("입력 오류", "출발점은 차량 방향이 필요합니다.", parent=self)
+            return
+        self.app.apply_point_values(self.kind, self.idx, x, y, heading,
+                                    self.vg.get() if self.vg is not None else None)
+        self.destroy()
 
 
 class VehicleDialog(tk.Toplevel):
