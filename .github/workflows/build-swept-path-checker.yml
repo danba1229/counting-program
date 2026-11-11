@@ -79,11 +79,8 @@ jobs:
         shell: pwsh
         run: |
           $src = Join-Path $env:RUNNER_TEMP "SweptPathChecker-source"
-          $zip = Join-Path $env:RUNNER_TEMP "src.zip"
-          git archive --format=zip -o $zip HEAD:swept-path-checker
-          Expand-Archive -Path $zip -DestinationPath $src -Force
-          if (-not (Test-Path (Join-Path $src "시작하기.pyw"))) { Get-ChildItem $src; throw "source extract failed" }
-          Remove-Item (Join-Path $src "run_app.bat") -ErrorAction SilentlyContinue
+          python tools/make_source_package.py $src
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           Push-Location $src
           python "시작하기.pyw" --check
           $code = $LASTEXITCODE
