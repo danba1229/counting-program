@@ -96,6 +96,28 @@ class Drawing:
         hi = self.bboxes[:, 2:].max(axis=0) * self.unit_scale
         return float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1])
 
+    def nearest_polyline(self, x: float, y: float, tol: float) -> int | None:
+        """(x, y) [도면 단위] 에서 tol 이내로 가장 가까운 폴리라인 번호. 없으면 None."""
+        if self.bboxes is None or not len(self.bboxes):
+            return None
+        bb = self.bboxes
+        cand = np.nonzero((bb[:, 0] - tol <= x) & (bb[:, 2] + tol >= x) &
+                          (bb[:, 1] - tol <= y) & (bb[:, 3] + tol >= y))[0]
+        if not len(cand):
+            return None
+        best, best_d = None, tol
+        p = np.array([x, y])
+        for i in cand[:5000]:
+            pts = self.verts[self.offsets[i]:self.offsets[i + 1]]
+            a, b = pts[:-1], pts[1:]
+            ab = b - a
+            L2 = np.einsum("ij,ij->i", ab, ab)
+            t = np.clip(np.einsum("ij,ij->i", p - a, ab) / np.where(L2 > 0, L2, 1), 0, 1)
+            d = np.hypot(*(a + ab * t[:, None] - p).T).min() if len(a) else np.hypot(*(pts[0] - p))
+            if d <= best_d:
+                best, best_d = int(i), float(d)
+        return best
+
     def default_obstacle_layers(self) -> set[str]:
         return {name for name in self.layer_counts if not NON_OBSTACLE_PATTERN.search(name)}
 

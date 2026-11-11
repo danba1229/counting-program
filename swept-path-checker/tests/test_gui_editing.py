@@ -123,3 +123,50 @@ def test_numeric_edit(gui):
     dlg.vx.set("21")
     dlg._apply()
     assert a.waypoints[0].x == 21
+
+
+@pytest.fixture()
+def gui_with_sample(gui):
+    a, appmod = gui
+    a.open_drawing(str(ROOT / "samples" / "sample_parking.dxf"), wait=True)
+    a.root.update()
+    return a, appmod
+
+
+def test_pick_layer_by_clicking_line(gui_with_sample):
+    a, appmod = gui_with_sample
+    assert "주차구획" not in a.obstacle_layers and "벽" in a.obstacle_layers
+    a.start_pick_mode()
+    assert a.tool_var.get() == appmod.TOOL_PICK
+    # 주차구획선 x=1.0 m, y 7.6~12 m
+    cx, cy = a.w2c(1.0, 9.0)
+    a._on_motion(E(cx + 3, cy))  # 3 px 옆에 마우스
+    assert a._pick_layer == "주차구획"
+    assert a.canvas.find_withtag("pickhl")
+    a._on_press(E(cx + 3, cy))
+    assert "주차구획" in a.obstacle_layers
+    assert a.layer_names.index("주차구획") in a.layer_list.curselection()
+    a._on_press(E(cx + 3, cy))  # 다시 누르면 해제
+    assert "주차구획" not in a.obstacle_layers
+    # 남쪽 벽(y=0) 클릭 → 벽 해제
+    a._on_press(E(*a.w2c(20.0, 0.0)))
+    assert "벽" not in a.obstacle_layers
+    # 빈 곳 클릭은 아무것도 안 바뀜
+    before = set(a.obstacle_layers)
+    a._on_press(E(*a.w2c(20.0, 3.5)))
+    assert a.obstacle_layers == before
+    # 다른 도구로 바꾸면 강조 표시 사라짐
+    a.tool_var.set(appmod.TOOL_WAYPOINT)
+    assert not a.canvas.find_withtag("pickhl")
+
+
+def test_layer_preset_save_and_load(gui_with_sample, tmp_path):
+    a, appmod = gui_with_sample
+    a.obstacle_layers = {"벽"}
+    p = tmp_path / "preset.json"
+    from swept_path.export import save_project
+
+    save_project(p, {"type": "swept-path-layers", "obstacle_layers": ["벽", "기둥", "없는레이어"]})
+    a.load_layer_preset(str(p))
+    assert a.obstacle_layers == {"벽", "기둥"}
+    assert "1개" in a.status.get()  # 없는 레이어 1개 건너뜀 안내

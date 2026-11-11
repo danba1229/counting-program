@@ -63,6 +63,9 @@ SUBPROCESS_LOAD_MB = 8.0  # 이보다 큰 파일은 별도 프로세스에서 �
 ASYNC_RENDER_LINES = 30000  # 화면에 보이는 선이 이보다 많으면 백그라운드에서 그림
 
 TOOL_START, TOOL_WAYPOINT, TOOL_DEST, TOOL_PAN = "start", "waypoint", "dest", "pan"
+TOOL_PICK = "pick"  # 도면의 선을 클릭해 장애물 레이어 켜기/끄기
+PICK_PX = 8  # 선 고르기 거리 (화면 px)
+PICK_HIGHLIGHT_MAX = 4000  # 강조 표시할 같은 레이어 선 최대 개수
 
 VEHICLE_FIELDS = [
     ("name", "차량 이름", str),
@@ -220,6 +223,12 @@ class SweptPathApp:
         ttk.Button(btns, text="전체 선택", command=lambda: self._set_all_layers(True)).pack(side=tk.LEFT)
         ttk.Button(btns, text="전체 해제", command=lambda: self._set_all_layers(False)).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="기본값", command=self._default_layers).pack(side=tk.LEFT)
+        ttk.Button(tab, text="🖱 도면에서 클릭해 장애물 레이어 켜기/끄기", command=self.start_pick_mode).pack(
+            fill=tk.X, pady=(6, 0))
+        pf = ttk.Frame(tab)
+        pf.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(pf, text="레이어 설정 저장", command=self.save_layer_preset).pack(side=tk.LEFT)
+        ttk.Button(pf, text="레이어 설정 불러오기", command=self.load_layer_preset).pack(side=tk.LEFT, padx=4)
         ttk.Button(tab, text="화면 맞춤", command=self.fit_view).pack(fill=tk.X, pady=(6, 0))
         ttk.Label(
             tab, foreground="#666", wraplength=340, justify="left",
@@ -250,10 +259,12 @@ class SweptPathApp:
         tool_frame = ttk.LabelFrame(tab, text="찍기 도구", padding=4)
         tool_frame.pack(fill=tk.X)
         self.tool_var = tk.StringVar(value=TOOL_START)
+        self.tool_var.trace_add("write", lambda *_: self._on_tool_change())
         for text, val in (("출발점 (누른 채 끌어서 차량 방향)", TOOL_START),
                           ("경유점", TOOL_WAYPOINT),
                           ("목적지 (끌면 도착 방향 지정)", TOOL_DEST),
-                          ("화면 이동", TOOL_PAN)):
+                          ("화면 이동", TOOL_PAN),
+                          ("장애물 레이어 고르기 (선 클릭)", TOOL_PICK)):
             ttk.Radiobutton(tool_frame, text=text, value=val, variable=self.tool_var).pack(anchor="w")
 
         gear_frame = ttk.LabelFrame(tab, text="진행 방향 (다음에 찍는 점까지)", padding=4)
@@ -390,6 +401,123 @@ class SweptPathApp:
     def _on_motion(self, e) -> None:
         x, y = self.c2w(e.x, e.y)
         self.coord_var.set(f"x = {x:,.2f} m   y = {y:,.2f} m")
+        if self.tool_var.get() == TOOL_PICK:
+            self._pick_hover(e.x, e.y)
+
+    # ---------------- 도면에서 레이어 고르기 ----------------
+    def _on_tool_change(self) -> None:
+        if self.tool_var.get() != TOOL_PICK and hasattr(self, "canvas"):
+            self.canvas.delete("pickhl")
+            self.canvas.config(cursor="crosshair")
+            self._pick_layer = None
+
+    def start_pick_mode(self) -> None:
+        if not self.drawing:
+            messagebox.showinfo("안내", "먼저 도면을 여세요.")
+            return
+        self.tool_var.set(TOOL_PICK)
+        self.set_status("도면의 선 위에 마우스를 올리면 레이어가 표시됩니다. 클릭하면 장애물 ↔ 장애물 아님 전환. "
+                        "끝나면 경로 탭에서 다른 도구를 고르세요.")
+
+    def _pick_at(self, cx: float, cy: float):
+        """화면 좌표 근처 선의 레이어 이름 (없으면 None)."""
+        d = self.drawing
+        if d is None:
+            return None
+        x, y = self.c2w(cx, cy)
+        k = d.unit_scale
+        i = d.nearest_polyline(x / k, y / k, PICK_PX / (self.s * k))
+        return None if i is None else d.layers[i]
+
+    def _pick_hover(self, cx: float, cy: float) -> None:
+        layer = self._pick_at(cx, cy)
+        if layer == getattr(self, "_pick_layer", None):
+            return
+        self._pick_layer = layer
+        self.canvas.delete("pickhl")
+        if layer is None:
+            self.canvas.config(cursor="crosshair")
+            return
+        self.canvas.config(cursor="hand2")
+        d = self.drawing
+        li = d.layer_names.index(layer)
+        vis = self.renderer._visible(max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1),
+                                     self.s, self.tx, self.ty) if self.renderer else None
+        mask = d.layer_index == li
+        if vis is not None:
+            mask &= vis
+        ids = np.nonzero(mask)[0][:PICK_HIGHLIGHT_MAX]
+        k = d.unit_scale
+        for i in ids:
+            pts = d.verts[d.offsets[i]:d.offsets[i + 1]] * k
+            self.canvas.create_line(self._flat(pts), fill="#ff8c00", width=3, tags=("world", "pickhl"))
+        self.canvas.tag_raise("path")
+        self.canvas.tag_raise("result")
+        state = "장애물" if layer in self.obstacle_layers else "장애물 아님"
+        self.set_status(f"레이어: {layer}  (선 {d.layer_counts[layer]:,}개)  현재 {state}  → 클릭하면 전환")
+
+    def _pick_click(self, cx: float, cy: float) -> None:
+        layer = self._pick_at(cx, cy)
+        if layer is None:
+            self.set_status("근처에 선이 없습니다. 선 위를 클릭하세요.")
+            return
+        on = layer not in self.obstacle_layers
+        if on:
+            self.obstacle_layers.add(layer)
+        else:
+            self.obstacle_layers.discard(layer)
+        self._obstacle_cache = None
+        i = self.layer_names.index(layer)
+        if on:
+            self.layer_list.selection_set(i)
+        else:
+            self.layer_list.selection_clear(i)
+        self.layer_list.see(i)
+        self.clear_results()
+        self.render_drawing()
+        self._pick_layer = None
+        self._pick_hover(cx, cy)
+        self.set_status(f"'{layer}' 레이어를 {'장애물로 지정' if on else '장애물에서 제외'}했습니다. "
+                        f"(장애물 레이어 {len(self.obstacle_layers)}개)")
+
+    # ---------------- 레이어 설정 저장/불러오기 ----------------
+    def save_layer_preset(self) -> None:
+        if not self.drawing:
+            messagebox.showinfo("안내", "먼저 도면을 여세요.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".json", initialfile="장애물레이어.json",
+                                            filetypes=[("레이어 설정", "*.json")])
+        if not path:
+            return
+        save_project(path, {"type": "swept-path-layers", "obstacle_layers": sorted(self.obstacle_layers),
+                            "drawing": self.drawing.path.name})
+        self.set_status(f"장애물 레이어 {len(self.obstacle_layers)}개를 저장했습니다: {path}")
+
+    def load_layer_preset(self, path: str | None = None) -> None:
+        if not self.drawing:
+            messagebox.showinfo("안내", "먼저 도면을 여세요.")
+            return
+        if path is None:
+            path = filedialog.askopenfilename(filetypes=[("레이어 설정", "*.json")])
+        if not path:
+            return
+        try:
+            data = load_project(path)
+            wanted = set(data["obstacle_layers"])
+        except Exception as exc:
+            messagebox.showerror("불러오기 실패", f"레이어 설정 파일이 아닙니다.\n{exc}")
+            return
+        present = set(self.layer_names)
+        self.obstacle_layers = wanted & present
+        missing = len(wanted - present)
+        self._obstacle_cache = None
+        self._fill_layer_list()
+        self.clear_results()
+        self.render_drawing()
+        msg = f"장애물 레이어 {len(self.obstacle_layers)}개를 적용했습니다."
+        if missing:
+            msg += f" (설정에 있지만 이 도면에 없는 레이어 {missing}개는 건너뜀)"
+        self.set_status(msg)
 
     # ---------------- 점 수정 ----------------
     HIT_PX = 9
@@ -526,6 +654,9 @@ class SweptPathApp:
         tool = self.tool_var.get()
         if tool == TOOL_PAN:
             self._pan_start(e)
+            return
+        if tool == TOOL_PICK:
+            self._pick_click(e.x, e.y)
             return
         hit = self._hit_point(e.x, e.y)
         if hit is not None:
@@ -730,6 +861,7 @@ class SweptPathApp:
         sel = {self.layer_names[i] for i in self.layer_list.curselection()}
         self.obstacle_layers = sel
         self._obstacle_cache = None
+        self.clear_results()  # 장애물이 바뀌었으므로 이전 판정은 지움
         self._recolor_layers()
 
     def _set_all_layers(self, on: bool) -> None:
