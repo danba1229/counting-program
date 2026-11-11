@@ -6,3 +6,4 @@ build/
 dist/
 *.zip
 selftest_result.txt
+.venv/

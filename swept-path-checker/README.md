@@ -39,6 +39,23 @@ pyinstaller --noconfirm SweptPathChecker.spec
 
 결과물: `dist\SweptPathChecker\` 폴더
 
+## exe 다운로드가 브라우저에서 막힐 때
+
+Chrome은 코드 서명이 없고 다운로드 이력이 적은 exe를 "흔하지 않은 파일"로 보고 자동 차단합니다(파일에 문제가 있다는 뜻은 아닙니다).
+
+**방법 1: 차단 해제 (가능한 경우)**
+`chrome://downloads` 에서 해당 항목의 **계속 / 위험한 파일 유지**를 누릅니다. 회사에서 관리하는 Chrome은 이 버튼이 없을 수 있습니다.
+
+**방법 2: exe 없이 실행 (권장)**
+1. https://www.python.org/downloads/ 에서 Python 3.12 설치 (서명된 정식 설치 파일)
+   - 설치 첫 화면에서 **Add python.exe to PATH** 체크
+2. Actions 실행 결과의 Artifacts에서 `SweptPathChecker-source` (실행 파일이 없는 소스 묶음)를 내려받아 압축 해제
+3. `시작하기.pyw` 더블클릭
+   - 처음 한 번은 필요한 부품을 자동 설치 (1~3분, 인터넷 필요)
+   - 다음부터는 바로 실행
+
+회사망에서 부품 설치(pip)가 막히면 전산 담당자에게 `pypi.org`, `files.pythonhosted.org` 접속 허용을 요청하세요.
+
 ## Python으로 실행 (Windows)
 
 1. Python 3.10 이상 설치 (설치 시 "Add python.exe to PATH" 체크)
@@ -129,6 +146,7 @@ DWG는 형식이 공개되어 있지 않아 직접 읽을 수 없습니다. 둘 
 ```
 swept-path-checker/
 ├─ app.py                 Tkinter GUI
+├─ 시작하기.pyw            exe 없이 실행 (처음 한 번 부품 자동 설치)
 ├─ swept_path/
 │  ├─ vehicles.py         차량 제원, 기본 차량, 사용자 차량 저장
 │  ├─ geometry.py         차체/바퀴 좌표 계산

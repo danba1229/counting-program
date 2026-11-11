@@ -74,3 +74,26 @@ jobs:
           name: SweptPathChecker-windows
           path: swept-path-checker/SweptPathChecker-windows.zip
           retention-days: 30
+
+      - name: Source package (no exe) and launcher check on a clean folder
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP "SweptPathChecker-source"
+          git archive --format=tar -o "$env:RUNNER_TEMP\src.tar" HEAD:swept-path-checker
+          New-Item -ItemType Directory -Force $src | Out-Null
+          tar -xf "$env:RUNNER_TEMP\src.tar" -C $src
+          Remove-Item (Join-Path $src "run_app.bat")
+          Push-Location $src
+          python "시작하기.pyw" --check
+          $code = $LASTEXITCODE
+          Pop-Location
+          Get-Content (Join-Path $src "selftest_result.txt") -Encoding UTF8
+          if ($code -ne 0) { exit 1 }
+          Remove-Item -Recurse -Force (Join-Path $src ".venv"), (Join-Path $src "selftest_result.txt")
+          "source files: $((Get-ChildItem -Recurse -File $src).Count)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SweptPathChecker-source
+          path: ${{ runner.temp }}/SweptPathChecker-source
+          retention-days: 30
