@@ -35,6 +35,10 @@ from swept_path.export import (  # noqa: E402
 )
 from swept_path.geometry import body_polygons  # noqa: E402
 from swept_path.render import DrawingRenderer, preview_transform  # noqa: E402
+from swept_path.ui_theme import (  # noqa: E402
+    BG, BORDER, DANGER, DANGER_BG, MUTED, PRIMARY, PRIMARY_DARK, SUCCESS, SUCCESS_BG, TEXT, WARN, WARN_BG,
+    apply_theme, card, draw_vehicle_diagram, enable_dpi_awareness,
+)
 from swept_path.simulate import FORWARD, REVERSE, Scenario, SimOptions, Simulator, Waypoint  # noqa: E402
 from swept_path.vehicles import SEMITRAILER, SINGLE, Vehicle, VehicleLibrary  # noqa: E402
 
@@ -139,187 +143,317 @@ class SweptPathApp:
     # UI 구성
     # ==================================================================
     def _build_ui(self) -> None:
+        self.fonts = apply_theme(self.root)
+        F = self.fonts
         menubar = tk.Menu(self.root)
         fmenu = tk.Menu(menubar, tearoff=0)
-        fmenu.add_command(label="도면 열기...", command=self.open_drawing)
+        fmenu.add_command(label="도면 열기...", accelerator="Ctrl+O", command=self.open_drawing)
         fmenu.add_command(label="샘플 도면 열기", command=self.open_sample)
         fmenu.add_separator()
-        fmenu.add_command(label="작업 저장...", command=self.save_project)
+        fmenu.add_command(label="작업 저장...", accelerator="Ctrl+S", command=self.save_project)
         fmenu.add_command(label="작업 불러오기...", command=self.load_project)
         fmenu.add_separator()
         fmenu.add_command(label="종료", command=self.root.destroy)
         menubar.add_cascade(label="파일", menu=fmenu)
+        hmenu = tk.Menu(menubar, tearoff=0)
+        hmenu.add_command(label="단축키 / 사용법", command=self.show_help)
+        menubar.add_cascade(label="도움말", menu=hmenu)
         self.root.config(menu=menubar)
 
         # 하단 요소를 먼저 배치해야 창이 작을 때도 잘리지 않는다.
         self.status = tk.StringVar()
-        bar = ttk.Frame(self.root)
+        bar = ttk.Frame(self.root, style="TFrame")
         bar.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Label(bar, textvariable=self.status, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        ttk.Label(bar, textvariable=self.status, style="Status.TLabel", anchor="w").pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
         self.coord_var = tk.StringVar()
-        ttk.Label(bar, textvariable=self.coord_var, width=34, anchor="e").pack(side=tk.RIGHT, padx=6)
+        ttk.Label(bar, textvariable=self.coord_var, style="Status.TLabel", width=36, anchor="e").pack(side=tk.RIGHT)
 
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True)
+        self._paned = main
+        self.root.after(60, lambda: main.sashpos(0, 420))  # 왼쪽 설정 패널 폭
 
-        left = ttk.Frame(main, width=380)
+        left = ttk.Frame(main, width=410, padding=(8, 8, 4, 8))
         main.add(left, weight=0)
-        right = ttk.Frame(main)
+        right = ttk.Frame(main, padding=(4, 8, 8, 8))
         main.add(right, weight=1)
 
         run_frame = ttk.Frame(left)
-        run_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(0, 6))
-        self.run_btn = ttk.Button(run_frame, text="▶ 회전 검토 실행", command=self.run_check)
-        self.run_btn.pack(fill=tk.X, ipady=6)
+        run_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        self.run_btn = ttk.Button(run_frame, text="▶  회전 검토 실행   (Ctrl+Enter)", style="Accent.TButton",
+                                  command=self.run_check)
+        self.run_btn.pack(fill=tk.X)
 
         self.nb = ttk.Notebook(left)
-        self.nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.nb.pack(fill=tk.BOTH, expand=True)
         self._build_drawing_tab()
         self._build_vehicle_tab()
         self._build_path_tab()
         self._build_result_tab()
 
-        self.canvas = tk.Canvas(right, bg="white", highlightthickness=0, cursor="crosshair")
+        self._build_toolbar(right)
+        canvas_card = ttk.Frame(right, style="Card.TFrame", padding=1)
+        canvas_card.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(canvas_card, bg="white", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.verdict_label = tk.Label(self.canvas, text="", font=("", 14, "bold"), bg="white")
-        self.verdict_label.place(x=10, y=8)
-        overlay = ttk.Frame(self.canvas)
-        overlay.place(relx=1.0, x=-10, y=8, anchor="ne")
-        ttk.Button(overlay, text="↶ 되돌리기", command=self.undo).pack(side=tk.LEFT)
-        ttk.Button(overlay, text="경로 초기화", command=self.clear_path).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(overlay, text="화면 맞춤", command=self.fit_view).pack(side=tk.LEFT, padx=(4, 0))
+        self.verdict_label = tk.Label(self.canvas, text="", font=F["header"], bg="white", padx=4, pady=2)
+        self.verdict_label.place(x=12, y=10)
+        self._build_legend()
+        self._build_empty_state()
+
+    # ---------------- 도구 막대 ----------------
+    TOOL_HINTS = {
+        TOOL_START: "출발점: 차량 앞축 중심을 누른 채, 차량이 바라볼 방향으로 끌었다 놓으세요. (Shift: 15° 단위)",
+        TOOL_WAYPOINT: "경유점: 차량 기준점이 지나갈 위치를 차례로 클릭하세요. 찍은 점을 끌면 위치가 바뀝니다.",
+        TOOL_DEST: "목적지: 클릭하거나, 누른 채 끌어서 도착 방향까지 지정하세요.",
+        TOOL_PAN: "화면 이동: 끌어서 이동, 휠로 확대·축소. (다른 도구에서도 휠 버튼·오른쪽 버튼으로 이동)",
+        TOOL_PICK: "레이어 고르기: 선 위에 마우스를 올리면 같은 레이어가 주황색으로 표시됩니다. 클릭 = 장애물 켜기/끄기",
+    }
+
+    def _build_toolbar(self, parent) -> None:
+        tb = ttk.Frame(parent, style="Card.TFrame", padding=(6, 5))
+        tb.pack(fill=tk.X, pady=(0, 6))
+        self.tool_var = tk.StringVar(value=TOOL_START)
+        self.tool_var.trace_add("write", lambda *_: self._on_tool_change())
+        for text, val in (("●  출발점", TOOL_START), ("◆  경유점", TOOL_WAYPOINT), ("⚑  목적지", TOOL_DEST),
+                          ("✋  이동", TOOL_PAN), ("▤  레이어 고르기", TOOL_PICK)):
+            ttk.Radiobutton(tb, text=text, value=val, variable=self.tool_var, style="Tool.TRadiobutton",
+                            takefocus=False).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Label(tb, text="진행", style="CardMuted.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        self.gear_var = tk.IntVar(value=FORWARD)
+        for text, val in (("▲ 전진", FORWARD), ("▼ 후진", REVERSE)):
+            ttk.Radiobutton(tb, text=text, value=val, variable=self.gear_var, style="Tool.TRadiobutton",
+                            takefocus=False).pack(side=tk.LEFT, padx=(0, 2))
+        row2 = ttk.Frame(parent)
+        row2.pack(fill=tk.X, pady=(0, 6))
+        for text, cmd in (("⤢ 화면 맞춤 (F)", self.fit_view), ("경로 초기화", self.clear_path),
+                          ("↶ 되돌리기", self.undo)):
+            ttk.Button(row2, text=text, command=cmd, style="Small.TButton", takefocus=False).pack(
+                side=tk.RIGHT, padx=(4, 0))
+        self.hint_var = tk.StringVar(value=self.TOOL_HINTS[TOOL_START])
+        self.hint_label = ttk.Label(row2, textvariable=self.hint_var, style="Hint.TLabel", anchor="w")
+        self.hint_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.hint_label.bind("<Configure>", lambda e: self.hint_label.configure(wraplength=max(e.width - 20, 200)))
+
+    def _build_legend(self) -> None:
+        lg = tk.Frame(self.canvas, bg="#ffffff", highlightthickness=1, highlightbackground=BORDER, padx=8, pady=6)
+        lg.place(relx=1.0, rely=1.0, x=-10, y=-10, anchor="se")
+        self.legend = lg
+        self.legend_btn = tk.Label(self.canvas, text="범례 ▴", bg="#ffffff", fg=MUTED, font=self.fonts["small"],
+                                   highlightthickness=1, highlightbackground=BORDER, padx=6, pady=2, cursor="hand2")
+        self.legend_btn.bind("<Button-1>", lambda e: self._toggle_legend(True))
+        tk.Label(lg, text="범례  (클릭하면 접기)", bg="#ffffff", fg=MUTED, font=self.fonts["small"]).grid(
+            row=99, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        for w in [lg, *lg.winfo_children()]:
+            w.bind("<Button-1>", lambda e: self._toggle_legend(False))
+            w.configure(cursor="hand2")
+        items = [("장애물 선", COLOR_OBSTACLE, "line"), ("장애물 아님", COLOR_OTHER, "line"),
+                 ("경로 (전진)", COLOR_PATH_FWD, "line"), ("경로 (후진)", COLOR_PATH_REV, "dash"),
+                 ("차체 궤적", COLOR_ENVELOPE, "box"), ("여유폭", COLOR_CLEAR, "dash"),
+                 ("바퀴 궤적", COLOR_WHEEL, "line"), ("충돌", COLOR_COLLISION, "circle")]
+        for i, (label, color, kind) in enumerate(items):
+            c = tk.Canvas(lg, width=26, height=12, bg="#ffffff", highlightthickness=0)
+            if kind == "box":
+                c.create_rectangle(3, 2, 23, 10, outline=color, fill="#cfe0ff", width=2)
+            elif kind == "circle":
+                c.create_oval(8, 1, 18, 11, outline=color, width=2)
+            else:
+                c.create_line(2, 6, 24, 6, fill=color, width=2, dash=(4, 2) if kind == "dash" else ())
+            c.grid(row=i // 2, column=(i % 2) * 2, padx=(0, 3), pady=1)
+            tk.Label(lg, text=label, bg="#ffffff", fg=TEXT, font=self.fonts["small"]).grid(
+                row=i // 2, column=(i % 2) * 2 + 1, sticky="w", padx=(0, 10))
+
+    def _toggle_legend(self, show: bool) -> None:
+        if show:
+            self.legend_btn.place_forget()
+            self.legend.place(relx=1.0, rely=1.0, x=-10, y=-10, anchor="se")
+        else:
+            self.legend.place_forget()
+            self.legend_btn.place(relx=1.0, rely=1.0, x=-10, y=-10, anchor="se")
+
+    def _build_empty_state(self) -> None:
+        box = tk.Frame(self.canvas, bg="#ffffff")
+        tk.Label(box, text="도면을 열어 시작하세요", bg="#ffffff", fg=TEXT, font=self.fonts["header"]).pack()
+        tk.Label(box, text="DXF(또는 ODA 변환기가 있으면 DWG) 도면을 열고, 차량을 고른 뒤\n"
+                           "출발점 → 경유점 → 목적지를 찍고 [회전 검토 실행]을 누르면 됩니다.",
+                 bg="#ffffff", fg=MUTED, font=self.fonts["base"], justify="center").pack(pady=(6, 12))
+        btns = tk.Frame(box, bg="#ffffff")
+        btns.pack()
+        ttk.Button(btns, text="도면 열기 (Ctrl+O)", style="Accent.TButton", command=self.open_drawing).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="샘플 도면으로 시작", command=self.open_sample).pack(side=tk.LEFT, padx=4)
+        tk.Label(box, text="도면 없이 바로 점을 찍어 시험해 볼 수도 있습니다.", bg="#ffffff", fg=MUTED,
+                 font=self.fonts["small"]).pack(pady=(12, 0))
+        self.empty_state = box
+        self._update_empty_state()
+
+    def _update_empty_state(self) -> None:
+        if not hasattr(self, "empty_state"):
+            return
+        if self.drawing is None and self.start is None and not self._loading:
+            self.empty_state.place(relx=0.5, rely=0.45, anchor="center")
+        else:
+            self.empty_state.place_forget()
 
     # ---------------- 도면 탭 ----------------
     def _build_drawing_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=6)
-        self.nb.add(tab, text="1. 도면")
-        ttk.Button(tab, text="도면 열기 (DXF / DWG)", command=self.open_drawing).pack(fill=tk.X)
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="① 도면")
+        c1 = card(tab, "도면 파일")
+        c1.pack(fill=tk.X)
+        ttk.Button(c1, text="도면 열기 (DXF / DWG)", style="Accent.TButton", command=self.open_drawing).pack(fill=tk.X)
         self.file_var = tk.StringVar(value="열린 도면 없음")
-        ttk.Label(tab, textvariable=self.file_var, wraplength=340, foreground="#444").pack(fill=tk.X, pady=4)
-
-        row = ttk.Frame(tab)
-        row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="도면 단위").pack(side=tk.LEFT)
+        ttk.Label(c1, textvariable=self.file_var, style="CardMuted.TLabel", wraplength=360, justify="left").pack(
+            fill=tk.X, pady=(6, 4))
+        row = ttk.Frame(c1, style="Inner.TFrame")
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="도면 단위", style="Card.TLabel").pack(side=tk.LEFT)
         self.unit_var = tk.StringVar(value="mm")
-        unit_box = ttk.Combobox(row, textvariable=self.unit_var, values=list(UNIT_CHOICES), width=8,
+        unit_box = ttk.Combobox(row, textvariable=self.unit_var, values=list(UNIT_CHOICES), width=7,
                                 state="readonly")
         unit_box.pack(side=tk.LEFT, padx=6)
         unit_box.bind("<<ComboboxSelected>>", lambda e: self._on_unit_change())
         self.unit_info = tk.StringVar()
-        ttk.Label(row, textvariable=self.unit_info, foreground="#666").pack(side=tk.LEFT)
+        ttk.Label(row, textvariable=self.unit_info, style="CardMuted.TLabel").pack(side=tk.LEFT)
 
-        ttk.Label(tab, text="장애물 레이어 (선택된 레이어의 선을 벽·기둥으로 간주)").pack(anchor="w", pady=(8, 2))
-        lf = ttk.Frame(tab)
+        c2 = card(tab, "장애물 레이어")
+        c2.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        ttk.Label(c2, text="선택된(파란) 레이어의 선을 벽·기둥 같은 장애물로 봅니다.", style="CardMuted.TLabel").pack(
+            anchor="w")
+        srow = ttk.Frame(c2, style="Inner.TFrame")
+        srow.pack(fill=tk.X, pady=(6, 4))
+        ttk.Label(srow, text="🔍", style="Card.TLabel").pack(side=tk.LEFT)
+        self.layer_filter = tk.StringVar()
+        ent = ttk.Entry(srow, textvariable=self.layer_filter)
+        ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+        self.layer_filter.trace_add("write", lambda *_: self._fill_layer_list())
+        self.layer_count_var = tk.StringVar(value="")
+        ttk.Label(srow, textvariable=self.layer_count_var, style="CardMuted.TLabel").pack(side=tk.RIGHT)
+        # 아래쪽 버튼을 먼저 배치 (창이 작아도 잘리지 않게), 목록은 남는 공간을 채운다.
+        pf = ttk.Frame(c2, style="Inner.TFrame")
+        pf.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Button(pf, text="레이어 설정 저장", style="Small.TButton", command=self.save_layer_preset).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        ttk.Button(pf, text="레이어 설정 불러오기", style="Small.TButton", command=self.load_layer_preset).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        ttk.Button(c2, text="▤  도면에서 클릭해 장애물 레이어 켜기/끄기", command=self.start_pick_mode).pack(
+            side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        btns = ttk.Frame(c2, style="Inner.TFrame")
+        btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        for text, cmd in (("전체 선택", lambda: self._set_all_layers(True)),
+                          ("전체 해제", lambda: self._set_all_layers(False)), ("기본값", self._default_layers)):
+            ttk.Button(btns, text=text, style="Small.TButton", command=cmd).pack(side=tk.LEFT, padx=(0, 4))
+        lf = ttk.Frame(c2, style="Inner.TFrame")
         lf.pack(fill=tk.BOTH, expand=True)
-        self.layer_list = tk.Listbox(lf, selectmode=tk.MULTIPLE, exportselection=False, height=6)
+        self.layer_list = tk.Listbox(lf, selectmode=tk.MULTIPLE, exportselection=False, height=4,
+                                     activestyle="none")
         sb = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.layer_list.yview)
         self.layer_list.config(yscrollcommand=sb.set)
         self.layer_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.layer_list.bind("<<ListboxSelect>>", lambda e: self._on_layer_select())
 
-        btns = ttk.Frame(tab)
-        btns.pack(fill=tk.X, pady=4)
-        ttk.Button(btns, text="전체 선택", command=lambda: self._set_all_layers(True)).pack(side=tk.LEFT)
-        ttk.Button(btns, text="전체 해제", command=lambda: self._set_all_layers(False)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="기본값", command=self._default_layers).pack(side=tk.LEFT)
-        ttk.Button(tab, text="🖱 도면에서 클릭해 장애물 레이어 켜기/끄기", command=self.start_pick_mode).pack(
-            fill=tk.X, pady=(6, 0))
-        pf = ttk.Frame(tab)
-        pf.pack(fill=tk.X, pady=(4, 0))
-        ttk.Button(pf, text="레이어 설정 저장", command=self.save_layer_preset).pack(side=tk.LEFT)
-        ttk.Button(pf, text="레이어 설정 불러오기", command=self.load_layer_preset).pack(side=tk.LEFT, padx=4)
-        ttk.Button(tab, text="화면 맞춤", command=self.fit_view).pack(fill=tk.X, pady=(6, 0))
-        ttk.Label(
-            tab, foreground="#666", wraplength=340, justify="left",
-            text="마우스 휠: 확대/축소, 휠 버튼 또는 오른쪽 버튼 드래그: 화면 이동",
-        ).pack(fill=tk.X, pady=4)
-
     # ---------------- 차량 탭 ----------------
     def _build_vehicle_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=6)
-        self.nb.add(tab, text="2. 차량")
-        ttk.Label(tab, text="차량 유형").pack(anchor="w")
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="② 차량")
+        c1 = card(tab, "차량 유형")
+        c1.pack(fill=tk.X)
         self.vehicle_var = tk.StringVar()
-        self.vehicle_box = ttk.Combobox(tab, textvariable=self.vehicle_var, state="readonly")
-        self.vehicle_box.pack(fill=tk.X, pady=2)
+        self.vehicle_box = ttk.Combobox(c1, textvariable=self.vehicle_var, state="readonly")
+        self.vehicle_box.pack(fill=tk.X)
         self.vehicle_box.bind("<<ComboboxSelected>>", lambda e: self._on_vehicle_change())
-        self.vehicle_info = tk.Text(tab, height=8, wrap="word", relief="flat", bg="#f6f6f6")
-        self.vehicle_info.pack(fill=tk.BOTH, expand=True, pady=4)
-        btns = ttk.Frame(tab)
-        btns.pack(fill=tk.X)
+        self.vehicle_canvas = tk.Canvas(c1, height=170, bg="#ffffff", highlightthickness=0)
+        self.vehicle_canvas.pack(fill=tk.X, pady=(8, 0))
+        self.vehicle_canvas.bind("<Configure>", lambda e: self._draw_vehicle())
+
+        c2 = card(tab, "제원")
+        c2.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self.spec_frame = ttk.Frame(c2, style="Card.TFrame", padding=0)
+        self.spec_frame.configure(borderwidth=0)
+        self.spec_frame.pack(fill=tk.X)
+        self.vehicle_note = tk.StringVar()
+        ttk.Label(c2, textvariable=self.vehicle_note, style="CardMuted.TLabel", wraplength=360,
+                  justify="left").pack(fill=tk.X, pady=(8, 0))
+        btns = ttk.Frame(c2, style="Inner.TFrame")
+        btns.pack(fill=tk.X, side=tk.BOTTOM, pady=(8, 0))
         ttk.Button(btns, text="제원 편집 / 새 차량", command=self.edit_vehicle).pack(side=tk.LEFT)
         ttk.Button(btns, text="사용자 차량 삭제", command=self.delete_vehicle).pack(side=tk.LEFT, padx=4)
 
     # ---------------- 경로 탭 ----------------
     def _build_path_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=6)
-        self.nb.add(tab, text="3. 경로")
-
-        tool_frame = ttk.LabelFrame(tab, text="찍기 도구", padding=4)
-        tool_frame.pack(fill=tk.X)
-        self.tool_var = tk.StringVar(value=TOOL_START)
-        self.tool_var.trace_add("write", lambda *_: self._on_tool_change())
-        for text, val in (("출발점 (누른 채 끌어서 차량 방향)", TOOL_START),
-                          ("경유점", TOOL_WAYPOINT),
-                          ("목적지 (끌면 도착 방향 지정)", TOOL_DEST),
-                          ("화면 이동", TOOL_PAN),
-                          ("장애물 레이어 고르기 (선 클릭)", TOOL_PICK)):
-            ttk.Radiobutton(tool_frame, text=text, value=val, variable=self.tool_var).pack(anchor="w")
-
-        gear_frame = ttk.LabelFrame(tab, text="진행 방향 (다음에 찍는 점까지)", padding=4)
-        gear_frame.pack(fill=tk.X, pady=4)
-        self.gear_var = tk.IntVar(value=FORWARD)
-        ttk.Radiobutton(gear_frame, text="전진", value=FORWARD, variable=self.gear_var).pack(side=tk.LEFT)
-        ttk.Radiobutton(gear_frame, text="후진", value=REVERSE, variable=self.gear_var).pack(side=tk.LEFT, padx=10)
-        ttk.Label(gear_frame, text="(전진↔후진이 바뀌는 점에서 정지 후 방향전환)",
-                  foreground="#666").pack(side=tk.LEFT)
-
-        ttk.Label(tab, foreground="#666", wraplength=340, justify="left",
-                  text="찍은 점을 누른 채 끌면 위치 이동, 화살표 끝을 끌면 방향 수정. "
-                       "목록에서 더블클릭하면 숫자로 수정. Ctrl+Z: 되돌리기").pack(fill=tk.X)
-        self.point_list = tk.Listbox(tab, height=4, exportselection=False)
-        self.point_list.pack(fill=tk.BOTH, expand=True, pady=2)
-        self.point_list.bind("<Double-Button-1>", lambda e: self.edit_selected_point())
-        self.point_list.bind("<<ListboxSelect>>", lambda e: self.draw_path())
-        pb = ttk.Frame(tab)
-        pb.pack(fill=tk.X)
-        ttk.Button(pb, text="선택 점 수정", command=self.edit_selected_point).pack(side=tk.LEFT)
-        ttk.Button(pb, text="선택 점 삭제", command=self.delete_selected_point).pack(side=tk.LEFT, padx=4)
-        ttk.Button(pb, text="전진/후진 전환", command=self.toggle_selected_gear).pack(side=tk.LEFT)
-        pb2 = ttk.Frame(tab)
-        pb2.pack(fill=tk.X, pady=(2, 0))
-        ttk.Button(pb2, text="↶ 되돌리기 (Ctrl+Z)", command=self.undo).pack(side=tk.LEFT)
-        ttk.Button(pb2, text="경로 초기화", command=self.clear_path).pack(side=tk.LEFT, padx=4)
-
-        opt = ttk.LabelFrame(tab, text="검토 조건", padding=4)
-        opt.pack(fill=tk.X, pady=6)
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="③ 경로")
+        opt = card(tab, "검토 조건")
+        opt.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))  # 아래 고정: 작은 화면에서도 잘리지 않게
+        grid = ttk.Frame(opt, style="Inner.TFrame")
+        grid.pack(fill=tk.X)
         self.opt_vars: dict[str, tk.Variable] = {}
         rows = [
-            ("clearance", "장애물 여유폭 (m)", 0.3),
-            ("speed", "전진 속도 (km/h)", 8.0),
-            ("rev_speed", "후진 속도 (km/h)", 4.0),
-            ("pos_tol", "목표점 허용오차 (m)", 0.5),
-            ("head_tol", "도착 방향 허용오차 (°)", 10.0),
+            ("clearance", "장애물 여유폭", 0.3, "m"),
+            ("speed", "전진 속도", 8.0, "km/h"),
+            ("rev_speed", "후진 속도", 4.0, "km/h"),
+            ("pos_tol", "목표점 허용오차", 0.5, "m"),
+            ("head_tol", "도착 방향 허용오차", 10.0, "°"),
         ]
-        for i, (key, label, default) in enumerate(rows):
-            ttk.Label(opt, text=label).grid(row=i, column=0, sticky="w")
+        for i, (key, label, default, unit) in enumerate(rows):
+            ttk.Label(grid, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", pady=2)
             var = tk.DoubleVar(value=default)
-            ttk.Entry(opt, textvariable=var, width=8).grid(row=i, column=1, sticky="w", padx=4)
+            ttk.Entry(grid, textvariable=var, width=8, justify="right").grid(row=i, column=1, sticky="w", padx=6)
+            ttk.Label(grid, text=unit, style="CardMuted.TLabel").grid(row=i, column=2, sticky="w")
             self.opt_vars[key] = var
         self.stationary_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt, text="정지 상태 핸들 조작 허용 (출발·방향전환 시)",
-                        variable=self.stationary_var).grid(row=len(rows), column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(opt, text="정지 상태 핸들 조작 허용 (출발·방향전환 시)", style="Card.TCheckbutton",
+                        variable=self.stationary_var).pack(anchor="w", pady=(6, 0))
+
+        c1 = card(tab, "찍은 점")
+        c1.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(c1, style="CardMuted.TLabel", wraplength=360, justify="left",
+                  text="도면 위 도구 막대에서 출발점 → 경유점 → 목적지를 찍으세요. 점을 끌면 이동, "
+                       "화살표 끝을 끌면 방향 수정, 더블클릭하면 숫자로 수정합니다.").pack(fill=tk.X, pady=(0, 6))
+        pb = ttk.Frame(c1, style="Inner.TFrame")
+        pb.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        for text, cmd in (("수정", self.edit_selected_point), ("삭제", self.delete_selected_point),
+                          ("전진/후진 전환", self.toggle_selected_gear)):
+            ttk.Button(pb, text=text, style="Small.TButton", command=cmd).pack(side=tk.LEFT, padx=(0, 4))
+
+        tf = ttk.Frame(c1, style="Inner.TFrame")
+        tf.pack(fill=tk.BOTH, expand=True)
+        cols = ("kind", "gear", "x", "y", "heading")
+        self.point_list = ttk.Treeview(tf, columns=cols, show="headings", height=3, selectmode="browse")
+        for col, text, w, anchor in (("kind", "구분", 70, "w"), ("gear", "진행", 52, "center"),
+                                     ("x", "x (m)", 82, "e"), ("y", "y (m)", 82, "e"),
+                                     ("heading", "방향", 58, "e")):
+            self.point_list.heading(col, text=text)
+            self.point_list.column(col, width=w, anchor=anchor, stretch=col in ("x", "y"))
+        self.point_list.tag_configure("rev", foreground=COLOR_PATH_REV)
+        self.point_list.tag_configure("start", foreground=PRIMARY_DARK)
+        psb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self.point_list.yview)
+        self.point_list.configure(yscrollcommand=psb.set)
+        self.point_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        psb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.point_list.bind("<Double-Button-1>", lambda e: self.edit_selected_point())
+        self.point_list.bind("<<TreeviewSelect>>", lambda e: self.draw_path())
 
     # ---------------- 결과 탭 ----------------
     def _build_result_tab(self) -> None:
-        tab = ttk.Frame(self.nb, padding=6)
-        self.nb.add(tab, text="4. 결과")
-        self.result_text = tk.Text(tab, height=8, wrap="word")
-        self.result_text.pack(fill=tk.BOTH, expand=True)
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="④ 결과")
+        # 아래쪽(저장 버튼, 표시 설정)을 먼저 배치해 창이 작아도 잘리지 않게 한다.
+        eb = ttk.Frame(tab)
+        eb.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        ttk.Button(eb, text="원본+결과 DXF", command=lambda: self.export_dxf(True)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(eb, text="결과만 DXF", command=lambda: self.export_dxf(False)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(eb, text="보고서 (txt)", command=self.export_report).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        show = ttk.LabelFrame(tab, text="표시", padding=4)
-        show.pack(fill=tk.X, pady=4)
+        c3 = card(tab, "화면 표시", pad=8)
+        c3.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        show = ttk.Frame(c3, style="Inner.TFrame")
+        show.pack(fill=tk.X)
         self.show_vars = {
             "envelope": tk.BooleanVar(value=True),
             "clearance": tk.BooleanVar(value=True),
@@ -330,19 +464,62 @@ class SweptPathApp:
         labels = {"envelope": "차체 궤적", "clearance": "여유폭 외곽", "wheels": "바퀴 궤적",
                   "corners": "모서리 궤적", "snapshots": "차량 윤곽"}
         for i, (k, var) in enumerate(self.show_vars.items()):
-            ttk.Checkbutton(show, text=labels[k], variable=var,
-                            command=self.draw_results).grid(row=i // 3, column=i % 3, sticky="w")
-
-        ttk.Label(tab, text="차량 위치 보기 (주행거리)").pack(anchor="w")
+            ttk.Checkbutton(show, text=labels[k], variable=var, style="Card.TCheckbutton",
+                            command=self.draw_results).grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 10))
+        srow = ttk.Frame(c3, style="Inner.TFrame")
+        srow.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(srow, text="차량 위치", style="Card.TLabel").pack(side=tk.LEFT)
+        self.scrub_label = tk.StringVar(value="")
+        ttk.Label(srow, textvariable=self.scrub_label, style="CardMuted.TLabel").pack(side=tk.RIGHT)
         self.scrub_var = tk.DoubleVar(value=0.0)
-        self.scrub = ttk.Scale(tab, from_=0, to=1, variable=self.scrub_var, command=lambda e: self.draw_scrub())
-        self.scrub.pack(fill=tk.X)
+        self.scrub = ttk.Scale(c3, from_=0, to=1, variable=self.scrub_var, command=lambda e: self.draw_scrub())
+        self.scrub.pack(fill=tk.X, pady=(2, 0))
 
-        eb = ttk.Frame(tab)
-        eb.pack(fill=tk.X, pady=4)
-        ttk.Button(eb, text="원본 도면 + 결과 DXF", command=lambda: self.export_dxf(True)).pack(side=tk.LEFT)
-        ttk.Button(eb, text="결과만 DXF", command=lambda: self.export_dxf(False)).pack(side=tk.LEFT, padx=4)
-        ttk.Button(eb, text="보고서(txt)", command=self.export_report).pack(side=tk.LEFT)
+        self.verdict_card = tk.Label(tab, text="아직 검토 전입니다", font=self.fonts["header"], bg="#e5e7eb",
+                                     fg=MUTED, pady=8)
+        self.verdict_card.pack(fill=tk.X)
+        c1 = card(tab, "요약", pad=8)
+        c1.pack(fill=tk.X, pady=(8, 0))
+        self.metric_frame = ttk.Frame(c1, style="Inner.TFrame")
+        self.metric_frame.pack(fill=tk.X)
+        c2 = card(tab, "판정 사유 · 구간별 결과", pad=8)
+        c2.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        tf = ttk.Frame(c2, style="Inner.TFrame")
+        tf.pack(fill=tk.BOTH, expand=True)
+        self.result_text = tk.Text(tf, height=4, wrap="word", relief="flat", bg="#ffffff", fg=TEXT,
+                                   font=self.fonts["base"], padx=2, pady=2, highlightthickness=0)
+        rsb = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=rsb.set)
+        self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        rsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_text.tag_configure("bad", foreground=DANGER, font=self.fonts["bold"])
+        self.result_text.tag_configure("warn", foreground=WARN)
+        self.result_text.tag_configure("head", foreground=TEXT, font=self.fonts["bold"], spacing1=6)
+        self.result_text.tag_configure("muted", foreground=MUTED)
+        self.result_text.config(state="disabled")
+
+    # ---------------- 단계 표시 / 도움말 ----------------
+    def _update_steps(self) -> None:
+        if not hasattr(self, "nb"):
+            return
+        done = [self.drawing is not None, True, self.scenario() is not None, self.analysis is not None]
+        names = ["도면", "차량", "경로", "결과"]
+        marks = ["①", "②", "③", "④"]
+        for i, (ok, name) in enumerate(zip(done, names)):
+            self.nb.tab(i, text=f"{'✓' if ok else marks[i]} {name}")
+
+    def show_help(self) -> None:
+        messagebox.showinfo("단축키 / 사용법", "\n".join([
+            "사용 순서: ① 도면 열기 → ② 차량 선택 → ③ 출발점·경유점·목적지 찍기 → 회전 검토 실행",
+            "",
+            "Ctrl+O  도면 열기          Ctrl+S  작업 저장",
+            "Ctrl+Enter  회전 검토 실행   Ctrl+Z  되돌리기",
+            "F  화면 맞춤               Delete  선택 점 삭제",
+            "Esc  끌기 취소",
+            "",
+            "마우스 휠: 확대·축소 / 휠 버튼·오른쪽 버튼 끌기: 화면 이동",
+            "찍은 점 끌기: 위치 이동 / 화살표 끝 끌기: 방향 수정 (Shift: 15° 단위)",
+        ]))
 
     # ==================================================================
     # 좌표 변환 / 캔버스
@@ -376,6 +553,15 @@ class SweptPathApp:
         self.root.bind("<Delete>", lambda e: self.delete_selected_point())
         self.root.bind("<Escape>", lambda e: self._cancel_drag())
         self.root.bind("<Control-z>", lambda e: self.undo())
+        self.root.bind("<Control-o>", lambda e: self.open_drawing())
+        self.root.bind("<Control-s>", lambda e: self.save_project())
+        self.root.bind("<Control-Return>", lambda e: self.run_check())
+
+        def fit_key(e):
+            if not isinstance(e.widget, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox)):
+                self.fit_view()
+
+        self.root.bind("<KeyPress-f>", fit_key)
         self.root.bind("<Control-Z>", lambda e: self.undo())
 
     def _zoom(self, cx, cy, f) -> None:
@@ -406,6 +592,8 @@ class SweptPathApp:
 
     # ---------------- 도면에서 레이어 고르기 ----------------
     def _on_tool_change(self) -> None:
+        if hasattr(self, "hint_var"):
+            self.hint_var.set(self.TOOL_HINTS.get(self.tool_var.get(), ""))
         if self.tool_var.get() != TOOL_PICK and hasattr(self, "canvas"):
             self.canvas.delete("pickhl")
             self.canvas.config(cursor="crosshair")
@@ -467,12 +655,15 @@ class SweptPathApp:
         else:
             self.obstacle_layers.discard(layer)
         self._obstacle_cache = None
-        i = self.layer_names.index(layer)
-        if on:
-            self.layer_list.selection_set(i)
-        else:
-            self.layer_list.selection_clear(i)
-        self.layer_list.see(i)
+        view = getattr(self, "_layer_view", self.layer_names)
+        if layer in view:
+            i = view.index(layer)
+            if on:
+                self.layer_list.selection_set(i)
+            else:
+                self.layer_list.selection_clear(i)
+            self.layer_list.see(i)
+        self._update_layer_count()
         self.clear_results()
         self.render_drawing()
         self._pick_layer = None
@@ -596,10 +787,10 @@ class SweptPathApp:
         return base + len(self.waypoints)
 
     def _select_in_list(self, kind: str, idx) -> None:
-        self.point_list.selection_clear(0, tk.END)
-        i = self._list_index(kind, idx)
-        self.point_list.selection_set(i)
-        self.point_list.see(i)
+        i = str(self._list_index(kind, idx))
+        if self.point_list.exists(i):
+            self.point_list.selection_set(i)
+            self.point_list.see(i)
 
     def _snapshot(self):
         return copy.deepcopy((self.start, self.waypoints, self.dest))
@@ -757,6 +948,7 @@ class SweptPathApp:
             return
 
         self._loading = True
+        self._update_empty_state()
         self.root.config(cursor="watch")
         size_mb = Path(path).stat().st_size / 1e6 if Path(path).exists() else 0
         use_process = size_mb >= SUBPROCESS_LOAD_MB and cached_drawing(path) is None
@@ -820,6 +1012,7 @@ class SweptPathApp:
         self.root.after(100, poll)
 
     def _on_drawing_error(self, exc: Exception) -> None:
+        self._update_empty_state()
         msg = str(exc) if isinstance(exc, DrawingError) else f"{type(exc).__name__}: {exc}"
         messagebox.showerror("도면 열기 실패", msg)
         self.set_status("도면 열기 실패")
@@ -836,7 +1029,11 @@ class SweptPathApp:
                           f"  ({elapsed:.1f}초)")
         self.layer_names = list(drawing.layer_names)
         self.obstacle_layers = drawing.default_obstacle_layers()
+        if hasattr(self, "layer_filter"):
+            self.layer_filter.set("")
         self._fill_layer_list()
+        self._update_empty_state()
+        self._update_steps()
         self.clear_results()
         self.fit_view()
         skipped = ", ".join(f"{k} {v}" for k, v in sorted(drawing.skipped.items()))
@@ -849,23 +1046,47 @@ class SweptPathApp:
             messagebox.showinfo("안내", f"샘플 도면이 없습니다:\n{SAMPLE_DRAWING}")
 
     def _fill_layer_list(self) -> None:
+        """레이어 목록 (검색어가 있으면 이름에 검색어가 들어간 레이어만)."""
         self.layer_list.delete(0, tk.END)
+        self._layer_view: list[str] = []
         if not self.drawing:
+            self._update_layer_count()
             return
-        for i, name in enumerate(self.layer_names):
-            self.layer_list.insert(tk.END, f"{name}  ({self.drawing.layer_counts[name]})")
+        q = self.layer_filter.get().strip().lower() if hasattr(self, "layer_filter") else ""
+        self._layer_view = [n for n in self.layer_names if q in n.lower()] if q else list(self.layer_names)
+        for i, name in enumerate(self._layer_view):
+            self.layer_list.insert(tk.END, f"{name}   ({self.drawing.layer_counts[name]:,})")
             if name in self.obstacle_layers:
                 self.layer_list.selection_set(i)
+        self._update_layer_count()
+
+    def _update_layer_count(self) -> None:
+        if not hasattr(self, "layer_count_var"):
+            return
+        if not self.drawing:
+            self.layer_count_var.set("")
+            return
+        txt = f"장애물 {len(self.obstacle_layers)} / {len(self.layer_names)}"
+        view = getattr(self, "_layer_view", self.layer_names)
+        if len(view) != len(self.layer_names):
+            txt += f"  · 검색 {len(view)}개"
+        self.layer_count_var.set(txt)
 
     def _on_layer_select(self) -> None:
-        sel = {self.layer_names[i] for i in self.layer_list.curselection()}
-        self.obstacle_layers = sel
+        view = getattr(self, "_layer_view", self.layer_names)
+        picked = {view[i] for i in self.layer_list.curselection()}
+        # 검색으로 안 보이는 레이어의 선택 상태는 그대로 둔다.
+        self.obstacle_layers = (self.obstacle_layers - set(view)) | picked
         self._obstacle_cache = None
         self.clear_results()  # 장애물이 바뀌었으므로 이전 판정은 지움
+        self._update_layer_count()
         self._recolor_layers()
 
     def _set_all_layers(self, on: bool) -> None:
-        self.obstacle_layers = set(self.layer_names) if on else set()
+        """전체 선택/해제. 검색 중이면 검색된 레이어에만 적용."""
+        view = set(getattr(self, "_layer_view", self.layer_names))  # 검색 결과가 없으면 아무것도 안 바뀜
+        self.obstacle_layers = (self.obstacle_layers | view) if on else (self.obstacle_layers - view)
+        self.clear_results()
         self._fill_layer_list()
         self._obstacle_cache = None
         self._recolor_layers()
@@ -1043,34 +1264,41 @@ class SweptPathApp:
 
     def _on_vehicle_change(self) -> None:
         v = self.vehicle
-        lines = [
-            f"{v.name}",
-            "",
-            f"전장 {v.overall_length:.2f} m   차폭 {v.width:.2f} m   차고 {v.height:.2f} m",
-            f"축간거리 {v.wheelbase:.2f} m   앞내민 {v.front_overhang:.2f} m   뒷내민 {v.rear_overhang:.2f} m",
-            f"윤거 {v.track:.2f} m",
-            f"최소회전반경(바깥 앞바퀴) {v.min_turn_radius:.2f} m",
-        ]
         try:
-            lines.append(f"→ 최대 조향각 {math.degrees(v.max_steer_rad):.1f}°")
+            steer = f"{math.degrees(v.max_steer_rad):.1f}°"
         except ValueError as exc:
-            lines.append(f"→ 제원 오류: {exc}")
-        lines.append(f"핸들 끝~끝 조작시간 {v.lock_to_lock_s:.1f} 초")
+            steer = f"오류: {exc}"
+        rows = [
+            ("전장", f"{v.overall_length:.2f} m", "차폭", f"{v.width:.2f} m"),
+            ("축간거리", f"{v.wheelbase:.2f} m", "차고", f"{v.height:.2f} m"),
+            ("앞 내민길이", f"{v.front_overhang:.2f} m", "뒤 내민길이", f"{v.rear_overhang:.2f} m"),
+            ("윤거", f"{v.track:.2f} m", "최대 조향각", steer),
+            ("최소회전반경", f"{v.min_turn_radius:.2f} m", "핸들 끝~끝", f"{v.lock_to_lock_s:.1f} 초"),
+        ]
         if v.is_articulated:
-            lines += [
-                "",
-                f"킹핀~트레일러축 {v.trailer_wheelbase:.2f} m, 킹핀 위치 {v.hitch_offset:+.2f} m",
-                f"트레일러 앞내민 {v.trailer_front_overhang:.2f} m, 뒷내민 {v.trailer_rear_overhang:.2f} m",
-                f"최대 꺾임각 {v.max_articulation_deg:.0f}°",
+            rows += [
+                ("킹핀~트레일러축", f"{v.trailer_wheelbase:.2f} m", "킹핀 위치", f"{v.hitch_offset:+.2f} m"),
+                ("트레일러 앞내민", f"{v.trailer_front_overhang:.2f} m", "트레일러 뒷내민",
+                 f"{v.trailer_rear_overhang:.2f} m"),
+                ("최대 꺾임각", f"{v.max_articulation_deg:.0f}°", "", ""),
             ]
-        if v.note:
-            lines += ["", f"비고: {v.note}"]
-        self.vehicle_info.config(state="normal")
-        self.vehicle_info.delete("1.0", tk.END)
-        self.vehicle_info.insert("1.0", "\n".join(lines))
-        self.vehicle_info.config(state="disabled")
+        for w in self.spec_frame.winfo_children():
+            w.destroy()
+        for r, (k1, v1, k2, v2) in enumerate(rows):
+            ttk.Label(self.spec_frame, text=k1, style="CardMuted.TLabel").grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Label(self.spec_frame, text=v1, style="Value.TLabel").grid(row=r, column=1, sticky="w", padx=(6, 16))
+            ttk.Label(self.spec_frame, text=k2, style="CardMuted.TLabel").grid(row=r, column=2, sticky="w")
+            ttk.Label(self.spec_frame, text=v2, style="Value.TLabel").grid(row=r, column=3, sticky="w", padx=(6, 0))
+        self.vehicle_note.set(("최소회전반경은 바깥쪽 앞바퀴 기준입니다.\n") + (f"비고: {v.note}" if v.note else ""))
+        self._draw_vehicle()
         self.clear_results()
         self.draw_path()
+
+    def _draw_vehicle(self) -> None:
+        try:
+            draw_vehicle_diagram(self.vehicle_canvas, self.vehicle, self.fonts)
+        except Exception:
+            pass
 
     def edit_vehicle(self) -> None:
         VehicleDialog(self.root, self.vehicle, self._on_vehicle_saved)
@@ -1116,25 +1344,36 @@ class SweptPathApp:
         self.clear_results()
         self._refresh_point_list()
         self.draw_path()
+        self._update_steps()
+        self._update_empty_state()
 
     def _refresh_point_list(self) -> None:
-        self.point_list.delete(0, tk.END)
+        tv = self.point_list
+        tv.delete(*tv.get_children())
+        rows = []
         if self.start:
             x, y, h = self.start
-            self.point_list.insert(tk.END, f"출발  ({x:.2f}, {y:.2f})  방향 {math.degrees(h):.1f}°")
+            rows.append(("출발", "", x, y, f"{math.degrees(h):.0f}°", "start"))
         for i, w in enumerate(self.waypoints, 1):
-            g = "전진" if w.gear == FORWARD else "후진"
-            self.point_list.insert(tk.END, f"{i}. {g}  ({w.x:.2f}, {w.y:.2f})")
+            rows.append((f"경유 {i}", "전진" if w.gear == FORWARD else "후진", w.x, w.y, "",
+                         "rev" if w.gear == REVERSE else ""))
         if self.dest:
-            g = "전진" if self.dest.gear == FORWARD else "후진"
-            h = f"  방향 {math.degrees(self.dest.heading):.1f}°" if self.dest.heading is not None else ""
-            self.point_list.insert(tk.END, f"목적지 {g}  ({self.dest.x:.2f}, {self.dest.y:.2f}){h}")
+            w = self.dest
+            rows.append(("목적지", "전진" if w.gear == FORWARD else "후진", w.x, w.y,
+                         "" if w.heading is None else f"{math.degrees(w.heading):.0f}°",
+                         "rev" if w.gear == REVERSE else ""))
+        for i, (kind, gear, x, y, head, tag) in enumerate(rows):
+            tv.insert("", tk.END, iid=str(i), values=(kind, gear, f"{x:,.2f}", f"{y:,.2f}", head),
+                      tags=(tag,) if tag else ())
+
+    def _point_sel_index(self) -> int | None:
+        sel = self.point_list.selection()
+        return int(sel[0]) if sel else None
 
     def _selected_point(self):
-        sel = self.point_list.curselection()
-        if not sel:
+        idx = self._point_sel_index()
+        if idx is None:
             return None
-        idx = sel[0]
         if self.start:
             if idx == 0:
                 return ("start", None)
@@ -1222,7 +1461,7 @@ class SweptPathApp:
                 ex, ey = self.w2c(w.x + L * math.cos(w.heading), w.y + L * math.sin(w.heading))
                 c.create_line(px, py, ex, ey, arrow=tk.LAST, width=2, fill=color, tags=tags)
             prev = (w.x, w.y)
-        sel = self._selected_point() if self.point_list.curselection() else None
+        sel = self._selected_point()
         if sel is not None:
             try:
                 px, py = self.w2c(*self._point_xy(*sel))
@@ -1274,7 +1513,7 @@ class SweptPathApp:
             messagebox.showerror("입력 오류", str(exc))
             return
         self._busy = True
-        self.run_btn.config(state="disabled")
+        self.run_btn.config(state="disabled", text="검토 중...")
         self.set_status("검토 중...")
 
         q: queue.Queue = queue.Queue()
@@ -1304,33 +1543,93 @@ class SweptPathApp:
 
     def _on_error(self, msg: str) -> None:
         self._busy = False
-        self.run_btn.config(state="normal")
+        self.run_btn.config(state="normal", text="▶  회전 검토 실행   (Ctrl+Enter)")
         self.set_status("검토 실패")
         messagebox.showerror("오류", msg)
 
     def _on_result(self, result: Analysis, sc: Scenario) -> None:
         self._busy = False
-        self.run_btn.config(state="normal")
+        self.run_btn.config(state="normal", text="▶  회전 검토 실행   (Ctrl+Enter)")
         self.analysis = result
         self.analysis_scenario = sc
-        self.result_text.delete("1.0", tk.END)
-        self.result_text.insert("1.0", "\n".join(result.summary_lines()))
+        self._show_result_summary(result)
         self.scrub.config(to=max(result.sim.total_distance, 0.01))
         self.scrub_var.set(0.0)
         self.draw_results()
         self.nb.select(3)
         verdict = "회전 가능" if result.feasible else "회전 불가"
-        self.verdict_label.config(text=f"  {verdict}  ", fg="white",
-                                  bg="#1a9b3c" if result.feasible else "#d62828")
+        self.verdict_label.config(text=f"  {'✔' if result.feasible else '✖'} {verdict}  ", fg="white",
+                                  bg=SUCCESS if result.feasible else DANGER)
+        self._update_steps()
         self.set_status(f"검토 완료: {verdict}")
 
+    def _show_result_summary(self, a: Analysis) -> None:
+        ok = a.feasible
+        warn = bool(a.warnings)
+        if ok:
+            text, fg, bg = ("✔ 회전 가능" + ("  (주의 있음)" if warn else ""), SUCCESS, SUCCESS_BG)
+        else:
+            text, fg, bg = ("✖ 회전 불가", DANGER, DANGER_BG)
+        self.verdict_card.config(text=text, fg=fg, bg=bg)
+        v, sim = a.vehicle, a.sim
+        metrics = [
+            ("차량", v.name),
+            ("총 주행거리", f"{sim.total_distance:.1f} m"),
+            ("구간 / 방향전환", f"{len(sim.legs)}구간 / {max(len(sim.legs) - 1, 0)}회"),
+            ("사용 최대 조향각", f"{a.max_steer_deg:.1f}° (한계 {math.degrees(v.max_steer_rad):.1f}°)"),
+            ("충돌·여유폭 부족", f"{len(a.collisions)}곳"),
+        ]
+        if v.is_articulated:
+            metrics.append(("최대 꺾임각", f"{a.max_articulation_deg:.1f}° (한계 {v.max_articulation_deg:.0f}°)"))
+        for w in self.metric_frame.winfo_children():
+            w.destroy()
+        for r, (k, val) in enumerate(metrics):
+            ttk.Label(self.metric_frame, text=k, style="CardMuted.TLabel").grid(row=r, column=0, sticky="w", pady=1)
+            lbl = ttk.Label(self.metric_frame, text=val, style="Value.TLabel")
+            lbl.grid(row=r, column=1, sticky="w", padx=(10, 0))
+            if k.startswith("충돌") and a.collisions:
+                lbl.configure(foreground=DANGER)
+        t = self.result_text
+        t.config(state="normal")
+        t.delete("1.0", tk.END)
+        if not a.reasons and not a.warnings:
+            t.insert(tk.END, "문제없이 목적지까지 도달했습니다.\n", "muted")
+        for r in a.reasons:
+            t.insert(tk.END, f"✖ {r}\n", "bad")
+        for w in a.warnings:
+            t.insert(tk.END, f"⚠ {w}\n", "warn")
+        t.insert(tk.END, "구간별 결과\n", "head")
+        for leg in sim.legs:
+            gear = "전진" if leg.gear == FORWARD else "후진"
+            extra = f", 방향오차 {leg.heading_error_deg:.1f}°" if leg.heading_error_deg is not None else ""
+            line = (f"{leg.index + 1}. {gear} {leg.length:.1f} m — {'도달' if leg.reached else '실패'} "
+                    f"(도착오차 {leg.end_error:.2f} m, 최대 경로이탈 {leg.max_deviation:.2f} m{extra})")
+            t.insert(tk.END, line + (f" · {leg.message}" if leg.message else "") + "\n",
+                     () if leg.reached else ("bad",))
+        if a.collisions:
+            t.insert(tk.END, "충돌 위치\n", "head")
+            for i, c in enumerate(a.collisions, 1):
+                part = "트레일러" if c.part == "trailer" else "차체"
+                t.insert(tk.END, f"{i}. {part}  x={c.x:,.2f}, y={c.y:,.2f}  (주행 {c.dist_from:.1f}~{c.dist_to:.1f} m)\n")
+        t.config(state="disabled")
+
     def clear_results(self) -> None:
+        had = self.analysis is not None
         self.analysis = None
         self.analysis_scenario = None
         if hasattr(self, "canvas"):
             self.canvas.delete("result")
             self.canvas.delete("scrub")
             self.verdict_label.config(text="", bg="white")
+        if had and hasattr(self, "verdict_card"):
+            self.verdict_card.config(text="조건이 바뀌어 다시 검토가 필요합니다", fg=MUTED, bg="#e5e7eb")
+            for w in self.metric_frame.winfo_children():
+                w.destroy()
+            self.result_text.config(state="normal")
+            self.result_text.delete("1.0", tk.END)
+            self.result_text.config(state="disabled")
+            self.scrub_label.set("")
+        self._update_steps()
 
     def draw_results(self) -> None:
         c = self.canvas
@@ -1386,7 +1685,9 @@ class SweptPathApp:
             c.create_polygon(self._flat(poly), outline="black", fill="#ffe08a", width=2,
                              tags=("world", "scrub", "overlay"))
         gear = "전진" if sim.gear[i] == FORWARD else "후진"
-        self.set_status(f"주행 {sim.dist[i]:.1f} m  {gear}  조향 {math.degrees(sim.steer[i]):+.1f}°")
+        msg = f"주행 {sim.dist[i]:.1f} / {sim.total_distance:.1f} m · {gear} · 조향 {math.degrees(sim.steer[i]):+.1f}°"
+        self.scrub_label.set(msg)
+        self.set_status(msg)
 
     # ==================================================================
     # 저장
@@ -1499,6 +1800,7 @@ class PointDialog(tk.Toplevel):
 
     def __init__(self, master, app: "SweptPathApp", kind: str, idx):
         super().__init__(master)
+        self.configure(bg=BG)
         self.app, self.kind, self.idx = app, kind, idx
         names = {"start": "출발점", "dest": "목적지"}
         self.title(f"{names.get(kind, f'{idx + 1}번 경유점')} 수정")
@@ -1558,6 +1860,7 @@ class PointDialog(tk.Toplevel):
 class VehicleDialog(tk.Toplevel):
     def __init__(self, master, vehicle: Vehicle, on_save):
         super().__init__(master)
+        self.configure(bg=BG)
         self.title("차량 제원 편집")
         self.resizable(False, False)
         self.transient(master)
@@ -1631,11 +1934,8 @@ def main() -> None:
         from selftest import run_selftest
 
         sys.exit(run_selftest(SAMPLE_DRAWING, APP_DIR, SweptPathApp))
+    enable_dpi_awareness()  # 고해상도 화면에서 글자 선명하게 (Tk 생성 전에)
     root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista" if sys.platform == "win32" else "clam")
-    except tk.TclError:
-        pass
     app = SweptPathApp(root)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if args:

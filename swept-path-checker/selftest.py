@@ -138,7 +138,7 @@ def run_selftest(sample: Path, out_dir: Path, app_class) -> int:
                 time.sleep(0.02)
             assert gui.analysis is not None, "검토 결과가 30초 안에 나오지 않음"
             verdict = gui.verdict_label.cget("text").strip()
-            assert verdict == "회전 불가", verdict
+            assert "회전 불가" in verdict and "가능" not in verdict, verdict
             root.update()
             items = len(gui.canvas.find_withtag("result"))
             assert items > 10, f"결과 궤적 요소 {items}개"

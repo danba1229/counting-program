@@ -170,3 +170,31 @@ def test_layer_preset_save_and_load(gui_with_sample, tmp_path):
     a.load_layer_preset(str(p))
     assert a.obstacle_layers == {"벽", "기둥"}
     assert "1개" in a.status.get()  # 없는 레이어 1개 건너뜀 안내
+
+
+def test_layer_search_filter_keeps_hidden_selection(gui_with_sample):
+    a, appmod = gui_with_sample
+    assert a.obstacle_layers == {"벽", "기둥"}
+    a.layer_filter.set("주차")
+    assert a._layer_view == ["주차구획"]
+    assert "검색 1개" in a.layer_count_var.get()
+    a.layer_list.selection_set(0)
+    a._on_layer_select()
+    assert a.obstacle_layers == {"벽", "기둥", "주차구획"}  # 숨겨진 벽·기둥은 그대로
+    a._set_all_layers(False)  # 검색 중 '전체 해제'는 검색된 레이어에만
+    assert a.obstacle_layers == {"벽", "기둥"}
+    a.layer_filter.set("없는이름")
+    a._set_all_layers(True)  # 검색 결과 없음 → 아무것도 안 바뀜
+    assert a.obstacle_layers == {"벽", "기둥"}
+    a.layer_filter.set("")
+    assert len(a._layer_view) == 3
+
+
+def test_step_marks_and_empty_state(gui):
+    a, appmod = gui
+    assert a.empty_state.winfo_manager() == "place"  # 처음에는 안내 화면
+    a.open_drawing(str(ROOT / "samples" / "sample_parking.dxf"), wait=True)
+    a.root.update()
+    assert a.empty_state.winfo_manager() == ""
+    assert a.nb.tab(0, "text").startswith("✓")
+    assert not a.nb.tab(2, "text").startswith("✓")  # 경로 아직 없음
