@@ -151,7 +151,17 @@ def run_selftest(sample: Path, out_dir: Path, app_class) -> int:
             time.sleep(0.2)
             root.update()
             assert gui._dwg_base is not None and gui._dwg_base[1] == (gui.s, gui.tx, gui.ty), "이동 후 다시 그리기 안 됨"
-            return f"화면 판정 '{verdict}', 결과 궤적 요소 {items}개, 확대·이동 후 다시 그리기 정상"
+            # 그림 보고서 (PDF / PNG)
+            tmp = Path(tempfile.mkdtemp())
+            gui.write_figure_report(str(tmp / "보고서.pdf"), "pdf")
+            gui.write_figure_report(str(tmp / "그림.png"), "png")
+            head = (tmp / "보고서.pdf").read_bytes()[:5]
+            assert head == b"%PDF-", head
+            assert (tmp / "그림.png").stat().st_size > 20000
+            from swept_path import report as _rep
+            assert _rep._font_files and _rep._font_files[0], "한글 글꼴을 찾지 못함"
+            return (f"화면 판정 '{verdict}', 결과 궤적 요소 {items}개, 확대·이동 후 다시 그리기 정상, "
+                    f"PDF·PNG 보고서 저장 (글꼴 {Path(_rep._font_files[0]).name})")
         finally:
             root.destroy()
 

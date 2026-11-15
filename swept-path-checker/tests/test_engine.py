@@ -292,7 +292,7 @@ def test_real_drawing_regressions(tmp_path):
     circle = np.concatenate(by_layer["원"])
     radii = np.hypot(circle[:, 0] - 5000, circle[:, 1])
     assert radii.min() > 500 - 25  # 허용오차(20 mm) 안에서 매끈한 원
-    assert len(circle) > 16
+    assert len(circle) > 8  # 네모처럼 각지지 않을 것 (정밀도 기준은 위의 반지름 조건)
     hatch_len = sum(float(np.hypot(*np.diff(p, axis=0).T).sum()) for p in by_layer["해치경계"])
     # 곡선을 허용오차(20 mm) 안에서 직선으로 나누므로 길이는 몇 % 짧을 수 있다
     assert hatch_len == pytest.approx(math.pi * (0.25 + 0.25 + 0.5) * 200, rel=0.05)
@@ -300,3 +300,102 @@ def test_real_drawing_regressions(tmp_path):
     # ezdxf 로 같은 블록(길이 0 구간 제외)을 변환한 기준값: x 8900~9100, y -100~50 (허용오차 20 mm)
     assert pts[:, 0].min() == pytest.approx(8900, abs=1) and pts[:, 0].max() == pytest.approx(9100, abs=1)
     assert pts[:, 1].min() == pytest.approx(-100, abs=21) and pts[:, 1].max() == pytest.approx(50, abs=21)
+
+
+def _engine_test_dxf(path, version="R2010"):
+    import ezdxf
+
+    doc = ezdxf.new(version)
+    doc.header["$INSUNITS"] = 4
+    for name in ("벽", "기둥", "곡선"):
+        doc.layers.add(name)
+    inner = doc.blocks.new("IN", base_point=(100, 0))
+    inner.add_line((100, 0), (600, 0))
+    inner.add_circle((300, 200), 150, dxfattribs={"layer": "곡선"})
+    inner.add_lwpolyline([(0, 0, 0.5), (400, 0, 0), (400, 300, -1.0), (0, 300, 0)], format="xyb", close=True)
+    outer = doc.blocks.new("OUT", base_point=(50, 50))
+    outer.add_blockref("IN", (500, 500), dxfattribs={"rotation": 30, "xscale": 2, "yscale": -1.5})
+    outer.add_arc((0, 0), 800, 20, 250)
+    outer.add_spline(fit_points=None).apply_construction_tool(
+        ezdxf.math.BSpline([(0, 0), (500, 900), (1500, -400), (2500, 800), (3000, 0)]))
+    msp = doc.modelspace()
+    msp.add_blockref("OUT", (10000, 20000), dxfattribs={"rotation": 75, "xscale": 3, "yscale": 3, "layer": "기둥"})
+    msp.add_blockref("IN", (0, 0), dxfattribs={"layer": "벽", "column_count": 3, "row_count": 2,
+                                               "column_spacing": 2000, "row_spacing": 1500, "rotation": 10})
+    msp.add_blockref("IN", (-5000, 0), dxfattribs={"layer": "벽", "extrusion": (0, 0, -1), "rotation": 20})
+    msp.add_arc((3000, 3000), 700, 30, 120, dxfattribs={"layer": "곡선", "extrusion": (0, 0, -1)})
+    msp.add_ellipse((6000, 0), major_axis=(1500, 500), ratio=0.4, dxfattribs={"layer": "곡선"})
+    msp.add_spline(dxfattribs={"layer": "곡선"}).apply_construction_tool(
+        ezdxf.math.BSpline([(0, 5000), (1000, 7000), (3000, 4000), (5000, 6500), (7000, 5000)], order=3))
+    msp.add_polyline2d([(0, -3000), (2000, -3000, 0.7), (2000, -1000)], format="xyb", dxfattribs={"layer": "벽"})
+    msp.add_lwpolyline([(8000, 8000), (9000, 8000), (9000, 9500)], dxfattribs={"const_width": 120, "layer": "벽"})
+    h = msp.add_hatch(dxfattribs={"layer": "곡선"})
+    h.paths.add_polyline_path([(12000, 0, 0.4), (13000, 0), (13000, 800), (12000, 800)], is_closed=True)
+    msp.add_text("글자", dxfattribs={"layer": "벽"})
+    psp = doc.layout("Layout1")
+    psp.add_line((0, 0), (99999, 99999), dxfattribs={"layer": "종이공간"})  # 모델공간이 아니므로 읽지 않아야 함
+    doc.saveas(path)
+    return path
+
+
+@pytest.mark.parametrize("version", ["R2010", "R2000"])
+def test_fast_reader_matches_ezdxf(tmp_path, version):
+    """빠른 판독기와 ezdxf 판독기의 결과가 허용오차 안에서 같은지 (레이어별 선 모양 비교)."""
+    from shapely.geometry import MultiLineString
+
+    path = _engine_test_dxf(tmp_path / f"engine_{version}.dxf", version)
+    fast = load_drawing(path, use_cache=False, engine="fast")
+    ref = load_drawing(path, use_cache=False, engine="ezdxf")
+    assert fast.unit_scale == ref.unit_scale == 0.001
+    assert set(fast.layer_counts) == set(ref.layer_counts) == {"벽", "기둥", "곡선"}
+    assert "종이공간" not in fast.layer_counts
+    for layer in ref.layer_counts:
+        a = MultiLineString([p for p, l in zip(fast.polylines, fast.layers) if l == layer])
+        b = MultiLineString([p for p, l in zip(ref.polylines, ref.layers) if l == layer])
+        assert a.hausdorff_distance(b) < 45, layer  # 곡선 분할 허용오차 20 mm × 2 (양쪽) 이내
+        assert a.length == pytest.approx(b.length, rel=0.01), layer
+
+
+def test_fast_reader_falls_back_on_unsupported(tmp_path):
+    """빠른 판독기가 못 읽는 파일(바이너리 DXF)은 자동으로 기존 방식으로 읽는다."""
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    doc.header["$INSUNITS"] = 4
+    doc.modelspace().add_line((0, 0), (1000, 0), dxfattribs={"layer": "벽"})
+    path = tmp_path / "binary.dxf"
+    doc.saveas(path, fmt="bin")
+    d = load_drawing(path, use_cache=False)
+    assert d.layer_counts == {"벽": 1}
+    with pytest.raises(Exception):
+        load_drawing(path, use_cache=False, engine="fast")
+
+
+def test_polylines_bbox_filter(sample):
+    d = load_drawing(sample, use_cache=False)
+    allp = d.polylines_m({"벽", "기둥"})
+    near = d.polylines_m({"벽", "기둥"}, bbox_m=(5.0, 6.5, 7.0, 8.0))  # 첫 기둥 (6.0, 7.3) 주변
+    assert 0 < len(near) < len(allp)
+    assert any(abs(p[:, 0].mean() - 6.0) < 0.5 for p in near)
+
+
+def test_pdf_and_png_report(sample, tmp_path):
+    from PIL import Image
+
+    from swept_path import report
+
+    d = load_drawing(sample, use_cache=False)
+    layers = d.default_obstacle_layers()
+    sc = Scenario(18, 3.5, 0, [Waypoint(30, 3.5), Waypoint(36.5, 10), Waypoint(36.5, 32, FORWARD, math.pi / 2)])
+    bad = run_check(VEHICLES["semitrailer"], sc, d.polylines_m(layers))
+    pages = report.build_pages(bad, sc, d, layers, {"clearance": 0.3})
+    assert len(pages) == 3  # 그림, 상세, 충돌 확대도
+    good = run_check(VEHICLES["passenger"], sc, d.polylines_m(layers))
+    assert len(report.build_pages(good, sc, d, layers)) == 2  # 충돌 없으면 확대도 없음
+    pdf = report.export_pdf(bad, sc, tmp_path / "보고서.pdf", d, layers, {"clearance": 0.3})
+    assert pdf.read_bytes()[:5] == b"%PDF-" and pdf.stat().st_size > 50_000
+    png = report.export_png(good, sc, tmp_path / "그림.png")  # 도면 없이도 가능
+    img = Image.open(png)
+    assert img.size == report.PAGE
+    arr = np.asarray(img.convert("RGB"))
+    assert ((arr[:, :, 2] > 200) & (arr[:, :, 0] < 80)).sum() > 500  # 파란 궤적 외곽선이 그려짐

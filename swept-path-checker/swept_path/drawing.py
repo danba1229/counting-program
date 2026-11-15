@@ -33,8 +33,10 @@ SKIP_TYPES = {
     "OLE2FRAME", "UNDERLAY", "PDFUNDERLAY", "DWFUNDERLAY", "DGNUNDERLAY",
 }
 
+_U_ESCAPE = re.compile(r"\\U\+([0-9A-Fa-f]{4})")
+
 # 변환 방식이 바뀌면 올려서 예전 캐시를 무효화한다.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 CACHE_KEEP = 20  # 캐시 파일 최대 개수 (오래된 것부터 삭제)
 
 # 기본으로 장애물에서 제외할 레이어 이름 패턴
@@ -43,6 +45,50 @@ NON_OBSTACLE_PATTERN = re.compile(
     r"치수|문자|글자|해치|중심|그리드|도곽|기호|주기|주차구획)",
     re.IGNORECASE,
 )
+
+
+class _PolylineView:
+    """verts/offsets 배열을 폴리라인 목록처럼 보여준다 (수백만 개여도 메모리를 따로 쓰지 않음)."""
+
+    def __init__(self, verts, offsets):
+        self._v, self._o = verts, offsets
+
+    def __len__(self):
+        return len(self._o) - 1
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(len(self)))]
+        if i < 0:
+            i += len(self)
+        if not 0 <= i < len(self):
+            raise IndexError(i)
+        return self._v[self._o[i]:self._o[i + 1]]
+
+    def __iter__(self):
+        v, o = self._v, self._o.tolist()
+        for a, b in zip(o[:-1], o[1:]):
+            yield v[a:b]
+
+
+class _LayerView:
+    def __init__(self, index, names):
+        self._i, self._n = index, names
+
+    def __len__(self):
+        return len(self._i)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self._n[j] for j in self._i[i].tolist()]
+        return self._n[int(self._i[i])]
+
+    def __iter__(self):
+        n = self._n
+        return (n[j] for j in self._i.tolist())
+
+    def __eq__(self, other):
+        return list(self) == list(other)
 
 
 @dataclass
@@ -64,28 +110,35 @@ class Drawing:
     layer_names: list[str] = field(default_factory=list)
 
     def build_index(self) -> None:
-        self.layer_names = sorted(self.layer_counts)
-        pos = {name: i for i, name in enumerate(self.layer_names)}
+        """polylines / layers 목록 → 배열 색인."""
+        names = sorted(set(self.layers))
+        pos = {name: i for i, name in enumerate(names)}
         n = len(self.polylines)
         lengths = np.array([len(p) for p in self.polylines], dtype=np.int64)
-        self.offsets = np.concatenate([[0], np.cumsum(lengths)]) if n else np.zeros(1, dtype=np.int64)
-        self.verts = np.concatenate(self.polylines) if n else np.zeros((0, 2))
+        offsets = np.concatenate([[0], np.cumsum(lengths)]) if n else np.zeros(1, dtype=np.int64)
+        verts = np.concatenate(list(self.polylines)) if n else np.zeros((0, 2))
+        self.set_arrays(verts, offsets, np.array([pos[x] for x in self.layers], dtype=np.int32), names)
+
+    def set_arrays(self, verts: np.ndarray, offsets: np.ndarray, layer_index: np.ndarray,
+                   layer_names: list[str]) -> None:
+        """배열로 직접 채운다. polylines / layers 는 배열을 들여다보는 가벼운 목록이 된다."""
+        self.verts = np.ascontiguousarray(verts, dtype=float)
+        self.offsets = np.asarray(offsets, dtype=np.int64)
+        self.layer_index = np.asarray(layer_index, dtype=np.int32)
+        self.layer_names = list(layer_names)
+        n = len(self.layer_index)
         if n:
-            idx = np.repeat(np.arange(n), lengths)
-            lo_x = np.full(n, np.inf)
-            lo_y = np.full(n, np.inf)
-            hi_x = np.full(n, -np.inf)
-            hi_y = np.full(n, -np.inf)
-            np.minimum.at(lo_x, idx, self.verts[:, 0])
-            np.minimum.at(lo_y, idx, self.verts[:, 1])
-            np.maximum.at(hi_x, idx, self.verts[:, 0])
-            np.maximum.at(hi_y, idx, self.verts[:, 1])
-            self.bboxes = np.stack([lo_x, lo_y, hi_x, hi_y], axis=1)
+            starts = self.offsets[:-1]
+            self.bboxes = np.stack([
+                np.minimum.reduceat(self.verts[:, 0], starts), np.minimum.reduceat(self.verts[:, 1], starts),
+                np.maximum.reduceat(self.verts[:, 0], starts), np.maximum.reduceat(self.verts[:, 1], starts),
+            ], axis=1)
         else:
             self.bboxes = np.zeros((0, 4))
-        self.layer_index = np.array([pos[name] for name in self.layers], dtype=np.int32)
-        # 개별 폴리라인은 verts 의 뷰로 바꿔 메모리 중복을 없앤다.
-        self.polylines = np.split(self.verts, self.offsets[1:-1]) if n else []
+        counts = np.bincount(self.layer_index, minlength=len(self.layer_names)) if n else []
+        self.layer_counts = {name: int(c) for name, c in zip(self.layer_names, counts) if c}
+        self.polylines = _PolylineView(self.verts, self.offsets)
+        self.layers = _LayerView(self.layer_index, self.layer_names)
 
     def bounds_m(self) -> tuple[float, float, float, float] | None:
         if not self.polylines:
@@ -121,12 +174,23 @@ class Drawing:
     def default_obstacle_layers(self) -> set[str]:
         return {name for name in self.layer_counts if not NON_OBSTACLE_PATTERN.search(name)}
 
-    def polylines_m(self, layers: set[str] | None = None) -> list[np.ndarray]:
-        out = []
-        for pts, layer in zip(self.polylines, self.layers):
-            if layers is None or layer in layers:
-                out.append(pts * self.unit_scale)
-        return out
+    def polylines_m(self, layers: set[str] | None = None,
+                    bbox_m: tuple[float, float, float, float] | None = None) -> list[np.ndarray]:
+        """m 단위 폴리라인. layers: 이 레이어만 / bbox_m: 이 범위(xmin, ymin, xmax, ymax)에 걸친 것만."""
+        if self.bboxes is None:
+            self.build_index()
+        n = len(self.layer_index)
+        mask = np.ones(n, dtype=bool)
+        if layers is not None:
+            flags = np.array([name in layers for name in self.layer_names], dtype=bool)
+            mask &= flags[self.layer_index] if len(flags) else False
+        if bbox_m is not None:
+            k = self.unit_scale
+            x0, y0, x1, y1 = (v / k for v in bbox_m)
+            bb = self.bboxes
+            mask &= (bb[:, 2] >= x0) & (bb[:, 0] <= x1) & (bb[:, 3] >= y0) & (bb[:, 1] <= y1)
+        o, v, k = self.offsets, self.verts, self.unit_scale
+        return [v[o[i]:o[i + 1]] * k for i in np.nonzero(mask)[0].tolist()]
 
 
 class DrawingError(Exception):
@@ -161,7 +225,7 @@ def read_document(path: Path):
 
 
 def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None,
-                 use_cache: bool = True, cache_dir: Path | None = None) -> Drawing:
+                 use_cache: bool = True, cache_dir: Path | None = None, engine: str = "auto") -> Drawing:
     """도면을 읽어 선(폴리라인) 목록으로 만든다.
 
     progress: 진행 상황 문자열을 받는 콜백 (백그라운드 스레드에서 호출될 수 있음)
@@ -178,6 +242,75 @@ def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None,
             cached = _read_cache(cache_file, path)
             if cached is not None:
                 return cached
+    drawing = None
+    if engine in ("auto", "fast") and path.suffix.lower() == ".dxf":
+        from .fastdxf import FastDxfUnsupported
+
+        try:
+            drawing = _load_fast(path, flatten_tol_m, progress)
+        except FastDxfUnsupported:
+            if engine == "fast":
+                raise
+        except OSError as exc:
+            raise DrawingError(f"파일을 열 수 없습니다: {exc}") from exc
+        except Exception:
+            if engine == "fast":
+                raise
+            drawing = None  # 예상 못 한 구조 → 기존 방식으로 다시 읽는다
+    if drawing is None:
+        drawing = _load_ezdxf(path, flatten_tol_m, progress)
+    if cache_file is not None:
+        if progress:
+            progress("변환 결과 저장 중 (다음에는 빠르게 열림)...")
+        _write_cache(cache_file, drawing)
+    return drawing
+
+
+def _load_fast(path: Path, flatten_tol_m: float, progress) -> Drawing:
+    """빠른 판독기 (fastdxf): 흔한 객체는 직접 계산, 나머지만 ezdxf 로 변환."""
+    from . import fastdxf
+
+    if progress:
+        progress("파일 읽는 중...")
+    parsed = fastdxf.parse_file(path, SKIP_TYPES, progress)
+    drawing = Drawing(path=path, insunits=parsed.insunits, skipped=parsed.skipped)
+    scale = INSUNITS_TO_M.get(parsed.insunits)
+    if scale is None:
+        scale = fastdxf.guess_scale(parsed)
+        drawing.unit_guessed = True
+    drawing.unit_scale = scale
+    helper = _Collector(None, drawing, flatten_tol_m / scale)
+
+    def fallback(text, vertex_texts, tol):
+        from ezdxf.entities import factory
+        from ezdxf.lldxf.extendedtags import ExtendedTags
+
+        try:
+            entity = factory.load(ExtendedTags.from_text(text))
+            if vertex_texts:
+                for vt in vertex_texts:
+                    entity.vertices.append(factory.load(ExtendedTags.from_text(vt)))
+        except Exception:
+            helper.skip("읽기 오류")
+            return []
+        if entity.dxftype() == "POLYLINE" and not vertex_texts:
+            return []
+        return helper.primitive(entity, tol)
+
+    conv = fastdxf.Converter(parsed, flatten_tol_m / scale, fallback)
+    verts, counts, layers = conv.records(parsed.msp, conv.tol, 0, progress)
+    # 쓰이는 레이어만, 이름순으로 다시 번호를 매긴다
+    used = np.unique(layers)
+    names = [parsed.layer_names[i] for i in used.tolist()]
+    order = np.argsort(np.array(names, dtype=object), kind="stable") if names else np.zeros(0, dtype=int)
+    remap = np.zeros(len(parsed.layer_names), dtype=np.int32)
+    remap[used[order]] = np.arange(len(order), dtype=np.int32)
+    offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+    drawing.set_arrays(verts, offsets, remap[layers] if len(layers) else layers, [names[i] for i in order.tolist()])
+    return drawing
+
+
+def _load_ezdxf(path: Path, flatten_tol_m: float, progress) -> Drawing:
     if progress:
         progress("파일 해석 중...")
     doc = read_document(path)
@@ -199,14 +332,7 @@ def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None,
         collector.add_top(entity)
         if progress and i % 5000 == 0 and i:
             progress(f"객체 변환 중... {i:,} / {n:,}")
-    drawing.layer_counts = {}
-    for layer in drawing.layers:
-        drawing.layer_counts[layer] = drawing.layer_counts.get(layer, 0) + 1
     drawing.build_index()
-    if cache_file is not None:
-        if progress:
-            progress("변환 결과 저장 중 (다음에는 빠르게 열림)...")
-        _write_cache(cache_file, drawing)
     return drawing
 
 
@@ -296,21 +422,8 @@ def _read_cache(cache_file: Path, path: Path) -> Drawing | None:
                 return None
             d = Drawing(path=path, insunits=meta["insunits"], unit_scale=meta["unit_scale"],
                         unit_guessed=meta["unit_guessed"], skipped=meta["skipped"])
-            d.verts = z["verts"]
-            d.offsets = z["offsets"]
-            d.layer_index = z["layer_index"]
-        d.layer_names = meta["layer_names"]
-        d.layer_counts = meta["layer_counts"]
-        d.layers = [d.layer_names[i] for i in d.layer_index.tolist()]
-        n = len(d.layer_index)
-        lengths = np.diff(d.offsets)
-        idx = np.repeat(np.arange(n), lengths)
-        bb = np.empty((n, 4))
-        for col, (fn, axis) in enumerate(((np.minimum, 0), (np.minimum, 1), (np.maximum, 0), (np.maximum, 1))):
-            bb[:, col] = np.inf if fn is np.minimum else -np.inf
-            fn.at(bb[:, col], idx, d.verts[:, axis])
-        d.bboxes = bb
-        d.polylines = np.split(d.verts, d.offsets[1:-1]) if n else []
+            verts, offsets, layer_index = z["verts"], z["offsets"], z["layer_index"]
+        d.set_arrays(verts, offsets, layer_index, meta["layer_names"])
         try:
             os.utime(cache_file)  # 최근 사용 표시 (오래된 캐시부터 지움)
         except OSError:
@@ -377,6 +490,8 @@ class _Collector:
         """
         etype = entity.dxftype()
         layer = entity.dxf.get("layer", "0")
+        if "\\U+" in layer:  # 옛 형식 DXF 의 유니코드 표기 (\\U+BCBD → 벽)
+            layer = _U_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), layer)
         if etype in SKIP_TYPES:
             self.skip(etype)
             return []

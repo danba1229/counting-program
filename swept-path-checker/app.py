@@ -443,12 +443,19 @@ class SweptPathApp:
         self.nb.add(tab, text="④ 결과")
         # 아래쪽(저장 버튼, 표시 설정)을 먼저 배치해 창이 작아도 잘리지 않게 한다.
         eb = ttk.Frame(tab)
-        eb.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
-        ttk.Button(eb, text="원본+결과 DXF", command=lambda: self.export_dxf(True)).pack(
+        eb.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Button(eb, text="원본+결과 DXF", style="Small.TButton", command=lambda: self.export_dxf(True)).pack(
             side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(eb, text="결과만 DXF", command=lambda: self.export_dxf(False)).pack(
+        ttk.Button(eb, text="결과만 DXF", style="Small.TButton", command=lambda: self.export_dxf(False)).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=4)
-        ttk.Button(eb, text="보고서 (txt)", command=self.export_report).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(eb, text="글자 보고서 (txt)", style="Small.TButton", command=self.export_report).pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+        eb2 = ttk.Frame(tab)
+        eb2.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        ttk.Button(eb2, text="📄 보고서 저장 (PDF)", command=lambda: self.export_figure_report("pdf")).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        ttk.Button(eb2, text="🖼 그림 저장 (PNG)", command=lambda: self.export_figure_report("png")).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
 
         c3 = card(tab, "화면 표시", pad=8)
         c3.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
@@ -1486,15 +1493,17 @@ class SweptPathApp:
         chk = CheckOptions(clearance=max(vals["clearance"], 0.0))
         return sim, chk
 
-    def _obstacles(self):
+    def _obstacles(self, sim=None, vehicle=None, clearance: float = 0.0):
+        """충돌 검사용 장애물 선. sim 을 주면 차량이 지나가는 범위에 걸친 선만 쓴다 (큰 도면에서 빠름)."""
         if not self.drawing:
             return [], None
-        key = (frozenset(self.obstacle_layers), self.drawing.unit_scale)
-        if self._obstacle_cache and self._obstacle_cache[0] == key:
-            return self._obstacle_cache[1]
-        lines, tree = build_obstacles(self.drawing.polylines_m(self.obstacle_layers))
-        self._obstacle_cache = (key, (lines, tree))
-        return lines, tree
+        bbox = None
+        if sim is not None and len(sim.x):
+            # 차체는 뒷축 중심에서 차량 전체 길이보다 멀리 나가지 않는다
+            reach = (vehicle.overall_length if vehicle else 20.0) + clearance + 2.0
+            bbox = (float(sim.x.min()) - reach, float(sim.y.min()) - reach,
+                    float(sim.x.max()) + reach, float(sim.y.max()) + reach)
+        return build_obstacles(self.drawing.polylines_m(set(self.obstacle_layers), bbox_m=bbox))
 
     def run_check(self) -> None:
         if self._busy:
@@ -1520,8 +1529,8 @@ class SweptPathApp:
 
         def work():
             try:
-                lines, tree = self._obstacles()
                 sim = Simulator(vehicle, sim_opt).run(sc)
+                lines, tree = self._obstacles(sim, vehicle, chk_opt.clearance)
                 q.put(("ok", analyze(vehicle, sim, lines, tree, chk_opt)))
             except Exception as exc:
                 traceback.print_exc()
@@ -1552,6 +1561,14 @@ class SweptPathApp:
         self.run_btn.config(state="normal", text="▶  회전 검토 실행   (Ctrl+Enter)")
         self.analysis = result
         self.analysis_scenario = sc
+        # 보고서용: 검토 당시의 조건을 기록해 둔다
+        try:
+            self.analysis_conditions = {k: float(v.get()) for k, v in self.opt_vars.items()}
+        except (tk.TclError, ValueError):
+            self.analysis_conditions = {}
+        self.analysis_layers = set(self.obstacle_layers)
+        if self.drawing:
+            self.analysis_conditions["obstacle_layers"] = len(self.analysis_layers)
         self._show_result_summary(result)
         self.scrub.config(to=max(result.sim.total_distance, 0.01))
         self.scrub_var.set(0.0)
@@ -1716,6 +1733,33 @@ class SweptPathApp:
             messagebox.showerror("저장 실패", f"{type(exc).__name__}: {exc}")
             return
         self.set_status(f"저장했습니다: {path}")
+
+    def export_figure_report(self, kind: str) -> None:
+        """궤적 그림이 들어간 보고서 (PDF) 또는 그림 한 장 (PNG)."""
+        if not self.analysis:
+            messagebox.showinfo("안내", "먼저 회전 검토를 실행하세요.")
+            return
+        stem = (self.drawing.path.stem + "_") if self.drawing else ""
+        path = filedialog.asksaveasfilename(
+            defaultextension=f".{kind}", initialfile=f"{stem}회전검토.{kind}",
+            filetypes=[("PDF 보고서", "*.pdf")] if kind == "pdf" else [("PNG 그림", "*.png")])
+        if not path:
+            return
+        try:
+            self.write_figure_report(path, kind)
+        except Exception as exc:
+            traceback.print_exc()
+            messagebox.showerror("저장 실패", f"{type(exc).__name__}: {exc}")
+            return
+        self.set_status(f"저장했습니다: {path}")
+
+    def write_figure_report(self, path: str, kind: str) -> None:
+        from swept_path import report
+
+        cond = dict(getattr(self, "analysis_conditions", {}) or {})
+        fn = report.export_pdf if kind == "pdf" else report.export_png
+        fn(self.analysis, self.analysis_scenario, path, self.drawing,
+           getattr(self, "analysis_layers", set(self.obstacle_layers)), cond)
 
     def export_report(self) -> None:
         if not self.analysis:
