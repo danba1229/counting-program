@@ -289,7 +289,7 @@ class SweptPathApp:
     def _build_empty_state(self) -> None:
         box = tk.Frame(self.canvas, bg="#ffffff")
         tk.Label(box, text="도면을 열어 시작하세요", bg="#ffffff", fg=TEXT, font=self.fonts["header"]).pack()
-        tk.Label(box, text="DXF(또는 ODA 변환기가 있으면 DWG) 도면을 열고, 차량을 고른 뒤\n"
+        tk.Label(box, text="DXF(또는 GstarCAD·ODA 변환기가 있으면 DWG) 도면을 열고, 차량을 고른 뒤\n"
                            "출발점 → 경유점 → 목적지를 찍고 [회전 검토 실행]을 누르면 됩니다.",
                  bg="#ffffff", fg=MUTED, font=self.fonts["base"], justify="center").pack(pady=(6, 12))
         btns = tk.Frame(box, bg="#ffffff")

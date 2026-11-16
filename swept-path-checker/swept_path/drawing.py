@@ -280,10 +280,22 @@ def read_document(path: Path):
     suffix = path.suffix.lower()
     if suffix == ".dwg":
         from ezdxf.addons import odafc
+        from . import gstarcad
 
+        if gstarcad.is_installed():
+            import shutil
+
+            try:
+                dxf = gstarcad.convert_to_dxf(path)
+            except gstarcad.GstarCadError as exc:
+                raise DrawingError(str(exc)) from exc
+            try:
+                return read_document(dxf)
+            finally:
+                shutil.rmtree(dxf.parent, ignore_errors=True)
         if not odafc.is_installed():
             raise DrawingError(
-                "DWG 파일을 읽으려면 무료 'ODA File Converter'가 필요합니다.\n"
+                "DWG 파일을 읽으려면 GstarCAD 또는 무료 'ODA File Converter'가 필요합니다.\n"
                 "https://www.opendesign.com/guestfiles/oda_file_converter 에서 설치하거나,\n"
                 "CAD에서 DXF로 저장(다른 이름으로 저장 → DXF)한 파일을 열어주세요."
             )
@@ -319,7 +331,9 @@ def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None,
             if cached is not None:
                 return cached
     drawing = None
-    if engine in ("auto", "fast") and path.suffix.lower() == ".dxf":
+    if path.suffix.lower() == ".dwg":
+        drawing = _load_dwg_via_gstarcad(path, flatten_tol_m, progress, engine)
+    if drawing is None and engine in ("auto", "fast") and path.suffix.lower() == ".dxf":
         from .fastdxf import FastDxfUnsupported
 
         try:
@@ -340,6 +354,44 @@ def load_drawing(path: str | Path, flatten_tol_m: float = 0.02, progress=None,
             progress("변환 결과 저장 중 (다음에는 빠르게 열림)...")
         _write_cache(cache_file, drawing)
     return drawing
+
+
+def _load_dwg_via_gstarcad(path: Path, flatten_tol_m: float, progress, engine: str) -> Drawing | None:
+    """GstarCAD 가 있으면 DWG 를 임시 DXF 로 바꿔 읽는다. 없으면 None (ODA 경로로 넘어감)."""
+    from . import gstarcad
+
+    if not gstarcad.is_installed():
+        return None
+    import shutil
+
+    if progress:
+        progress("GstarCAD 로 DWG → DXF 변환 중... (처음 한 번, 10~60초)")
+    try:
+        dxf = gstarcad.convert_to_dxf(path)
+    except gstarcad.GstarCadError as exc:
+        raise DrawingError(
+            f"{exc}\nGstarCAD 에서 이 도면을 DXF 로 저장(다른 이름으로 저장 → DXF)한 뒤 열어 보세요."
+        ) from exc
+    try:
+        drawing = None
+        if engine in ("auto", "fast"):
+            from .fastdxf import FastDxfUnsupported
+
+            try:
+                drawing = _load_fast(dxf, flatten_tol_m, progress)
+            except FastDxfUnsupported:
+                if engine == "fast":
+                    raise
+            except Exception:
+                if engine == "fast":
+                    raise
+                drawing = None
+        if drawing is None:
+            drawing = _load_ezdxf(dxf, flatten_tol_m, progress)
+        drawing.path = path  # 화면·작업 파일에는 원래 DWG 경로를 남긴다
+        return drawing
+    finally:
+        shutil.rmtree(dxf.parent, ignore_errors=True)
 
 
 def _load_fast(path: Path, flatten_tol_m: float, progress) -> Drawing:
