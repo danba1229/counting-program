@@ -157,6 +157,111 @@ def builtin_vehicles() -> list[Vehicle]:
             ),
             builtin=True,
         ),
+        # ---- 실무 검토용 차량 ----
+        # 제작사가 공개한 전장·전폭·전고·축거(·윤거)를 쓰고, 공개되지 않은 앞·뒤 내민길이와
+        # 최소회전반경 등은 추정값이다. 비고에 어느 값이 추정인지 적었다. 제원표로 확인 후 고쳐 쓸 것.
+        Vehicle(
+            key="suv_carnival",
+            name="대형 SUV·승합 (카니발)",
+            width=1.995,
+            height=1.775,
+            wheelbase=3.09,
+            front_overhang=0.99,
+            rear_overhang=1.075,
+            track=1.741,
+            min_turn_radius=5.9,
+            lock_to_lock_s=3.0,
+            note=(
+                "기아 카니발 공식 제원(전장 5,155 / 전폭 1,995 / 전고 1,775 / 축거 3,090 / 윤거 1,741mm, 19인치) 기준. "
+                "앞·뒤 내민길이(0.99 / 1.075 m)와 최소회전반경(5.9 m)은 추정값"
+            ),
+            builtin=True,
+        ),
+        Vehicle(
+            key="ambulance_staria",
+            name="구급차 (스타리아)",
+            width=1.995,
+            height=2.12,
+            wheelbase=3.275,
+            front_overhang=0.94,
+            rear_overhang=1.04,
+            track=1.72,
+            min_turn_radius=6.0,
+            lock_to_lock_s=3.0,
+            note=(
+                "현대 스타리아 구급차 제원(전장 5,255 / 전폭 1,995 / 전고 2,120 / 축거 3,275mm, 자동차 정보 사이트) 기준. "
+                "앞·뒤 내민길이, 윤거, 최소회전반경(6.0 m)은 추정값. 개조 업체에 따라 다를 수 있음"
+            ),
+            builtin=True,
+        ),
+        Vehicle(
+            key="truck_1t_porter",
+            name="택배·1톤 트럭 (포터2 초장축)",
+            width=1.74,
+            height=1.97,
+            wheelbase=2.64,
+            front_overhang=1.03,
+            rear_overhang=1.505,
+            track=1.485,
+            min_turn_radius=5.5,
+            lock_to_lock_s=3.5,
+            note=(
+                "현대 포터2 초장축 일반캡 제원(전장 5,175 / 전폭 1,740 / 전고 1,970 / 축간거리 2,640mm) 기준. "
+                "앞·뒤 내민길이, 윤거, 최소회전반경(5.5 m)은 추정값. 탑차는 전고가 더 높음"
+            ),
+            builtin=True,
+        ),
+        Vehicle(
+            key="fire_pumper",
+            name="소방 펌프차 (중형, 추정)",
+            width=2.49,
+            height=3.1,
+            wheelbase=4.2,
+            front_overhang=1.3,
+            rear_overhang=2.0,
+            track=1.9,
+            min_turn_radius=8.0,
+            lock_to_lock_s=4.5,
+            note=(
+                "중형 펌프차의 일반적인 크기(전장 약 7.5 m)로 만든 추정 차량. 공개된 공식 제원을 찾지 못함. "
+                "관할 소방서 보유 차량 제원으로 바꿔 쓸 것"
+            ),
+            builtin=True,
+        ),
+        Vehicle(
+            key="bus_universe",
+            name="대형버스 (유니버스 12m)",
+            width=2.495,
+            height=3.45,
+            wheelbase=6.12,
+            front_overhang=2.49,
+            rear_overhang=3.41,
+            track=2.04,
+            min_turn_radius=11.0,
+            lock_to_lock_s=5.0,
+            note=(
+                "현대 유니버스 12m급 제원(전장 약 12,020 / 전폭 2,495 / 축거 6,120mm) 기준. "
+                "전고, 앞·뒤 내민길이, 윤거, 최소회전반경(11.0 m)은 추정값"
+            ),
+            builtin=True,
+        ),
+        Vehicle(
+            key="fire_ladder",
+            name="고가사다리차 (추정)",
+            width=2.5,
+            height=3.8,
+            wheelbase=5.8,
+            front_overhang=1.5,
+            rear_overhang=4.2,
+            track=2.04,
+            min_turn_radius=11.0,
+            lock_to_lock_s=5.0,
+            note=(
+                "3축 고가사다리차의 일반적인 크기(전장 약 11.5 m)로 만든 추정 차량. 축거는 앞축~뒤 2축 중심. "
+                "공개된 공식 제원을 찾지 못함. 관할 소방서 보유 차량 제원으로 바꿔 쓸 것"
+            ),
+            builtin=True,
+        ),
         Vehicle(
             key="large",
             name="대형자동차 (설계기준)",
