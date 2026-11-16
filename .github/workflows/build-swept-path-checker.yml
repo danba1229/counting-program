@@ -20,9 +20,9 @@ jobs:
       run:
         working-directory: swept-path-checker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -69,7 +69,7 @@ jobs:
           Compress-Archive -Path dist\SweptPathChecker -DestinationPath SweptPathChecker-windows.zip
           "{0:N1} MB" -f ((Get-Item SweptPathChecker-windows.zip).Length / 1MB)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: SweptPathChecker-windows
           path: swept-path-checker/SweptPathChecker-windows.zip
@@ -90,7 +90,7 @@ jobs:
           Remove-Item -Recurse -Force (Join-Path $src ".venv"), (Join-Path $src "selftest_result.txt")
           "source files: $((Get-ChildItem -Recurse -File $src).Count)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: SweptPathChecker-source
           path: ${{ runner.temp }}/SweptPathChecker-source

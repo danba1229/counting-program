@@ -443,3 +443,25 @@ def test_removing_pillars_changes_verdict(sample):
     after = run_check(VEHICLES["semitrailer"], sc, d.polylines_m(d.default_obstacle_layers()))
     # 기둥에 먼저 부딪히던 차량이, 기둥을 지우면 더 가서(다른 곳에서) 부딪히거나 통과한다
     assert after.feasible or after.collisions[0].dist_from > before.collisions[0].dist_from + 1.0
+
+
+def test_contact_vs_clearance_shortfall_and_min_gap():
+    v = VEHICLES["passenger"]
+    sc = Scenario(0, 0, 0, [Waypoint(20, 0)])
+    # 벽이 차체 옆 0.15 m: 닿지는 않고 여유폭(0.3)만 부족
+    near = run_check(v, sc, [np.array([[-10.0, 1.0], [40.0, 1.0]])])
+    assert not near.feasible
+    assert near.contact_count == 0 and near.clearance_count == 1
+    assert near.collisions[0].label == "여유폭 부족"
+    assert near.collisions[0].min_gap == pytest.approx(0.15, abs=0.01)
+    assert near.min_gap == pytest.approx(0.15, abs=0.01)
+    assert any("여유폭" in r for r in near.reasons) and not any("충돌" in r for r in near.reasons)
+    # 앞을 막는 벽: 실제로 닿음
+    hit = run_check(v, sc, [np.array([[10.0, -5.0], [10.0, 5.0]])])
+    assert hit.contact_count == 1 and hit.collisions[0].contact and hit.min_gap == 0.0
+    assert hit.min_gap_text() == "0 (닿음)"
+    # 벽이 0.6 m 떨어져 있으면 통과, 최소 이격이 표시된다
+    ok = run_check(v, sc, [np.array([[-10.0, 1.45], [40.0, 1.45]])])
+    assert ok.feasible and ok.min_gap == pytest.approx(0.6, abs=0.01)
+    # 가까운 장애물이 없으면 "1.0 m 이상"
+    assert run_check(v, sc, []).min_gap is None

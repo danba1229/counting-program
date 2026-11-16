@@ -6,8 +6,10 @@ from dataclasses import dataclass, field
 import math
 
 import numpy as np
+import shapely
 from shapely import STRtree
 from shapely.geometry import LineString, Polygon
+import shapely.ops
 from shapely.ops import unary_union
 
 from .geometry import body_polygons, tractor_points, trailer_points
@@ -33,6 +35,12 @@ class Collision:
     dist_to: float
     leg: int
     penetration_hint: str = ""
+    contact: bool = False  # True: 차체가 장애물에 닿음, False: 여유폭 안으로만 들어옴
+    min_gap: float = 0.0  # 이 구간에서 차체와 장애물 사이 최소 거리 (m, 닿으면 0)
+
+    @property
+    def label(self) -> str:
+        return "충돌" if self.contact else "여유폭 부족"
 
 
 @dataclass
@@ -49,6 +57,23 @@ class Analysis:
     snapshots: list[dict[str, np.ndarray]] = field(default_factory=list)
     max_steer_deg: float = 0.0
     max_articulation_deg: float = 0.0
+    # 전체 주행 중 차체와 장애물 사이 최소 거리 (m). 가까운 장애물이 없으면 None (= gap_probe 이상)
+    min_gap: float | None = None
+    min_gap_at: tuple[float, float, float] | None = None  # (x, y, 주행거리)
+    gap_probe: float = 1.0
+
+    @property
+    def contact_count(self) -> int:
+        return sum(1 for c in self.collisions if c.contact)
+
+    @property
+    def clearance_count(self) -> int:
+        return sum(1 for c in self.collisions if not c.contact)
+
+    def min_gap_text(self) -> str:
+        if self.min_gap is None:
+            return f"{self.gap_probe:.1f} m 이상"
+        return "0 (닿음)" if self.min_gap <= 1e-6 else f"{self.min_gap:.2f} m"
 
     def summary_lines(self) -> list[str]:
         v = self.vehicle
@@ -60,6 +85,7 @@ class Analysis:
             f"총 주행거리: {sim.total_distance:.1f} m, 구간 수: {len(sim.legs)} "
             f"(방향전환 {max(len(sim.legs) - 1, 0)}회)",
             f"사용 최대 조향각: {self.max_steer_deg:.1f}°",
+            f"차체-장애물 최소 이격: {self.min_gap_text()}",
         ]
         if v.is_articulated:
             lines.append(f"최대 꺾임각: {self.max_articulation_deg:.1f}°")
@@ -80,12 +106,12 @@ class Analysis:
             )
         if self.collisions:
             lines.append("")
-            lines.append("충돌 위치")
+            lines.append("충돌·여유폭 부족 위치")
             for i, c in enumerate(self.collisions, 1):
                 part = "트레일러" if c.part == "trailer" else "차체"
                 lines.append(
-                    f"  {i}. {part}  x={c.x:.2f}, y={c.y:.2f}  "
-                    f"(주행 {c.dist_from:.1f}~{c.dist_to:.1f} m 구간)"
+                    f"  {i}. [{c.label}] {part}  x={c.x:.2f}, y={c.y:.2f}  "
+                    f"(주행 {c.dist_from:.1f}~{c.dist_to:.1f} m 구간, 최소 이격 {c.min_gap:.2f} m)"
                 )
         return lines
 
@@ -134,34 +160,68 @@ def analyze(vehicle: Vehicle, sim: SimResult, lines: list[LineString], tree: STR
     warnings: list[str] = []
 
     # ---------------- 충돌 검사 ----------------
+    # 차체(여유폭 없이)와 장애물 선 사이 실제 거리로 판정한다.
+    #   거리 0        → 충돌 (차체가 닿음)
+    #   거리 < 여유폭 → 여유폭 부족
     collisions: list[Collision] = []
     open_events: dict[str, Collision] = {}
+    probe = max(co.clearance + 0.7, 1.0)  # 이 거리 안의 장애물만 거리를 잰다 (최소 이격 표시용)
+    min_gap: float | None = None
+    min_gap_at = None
     if tree is not None:
+        line_arr = np.array(lines, dtype=object)
         for i in _sample_indices(sim.dist, co.sample_step):
-            polys = body_polygons(vehicle, sim.x[i], sim.y[i], sim.theta[i], sim.phi[i],
-                                  margin=co.clearance)
+            st = (sim.x[i], sim.y[i], sim.theta[i], sim.phi[i])
+            body = body_polygons(vehicle, *st)
+            near = body_polygons(vehicle, *st, margin=probe)
             hit_parts = set()
-            for part, pts in polys.items():
+            for part, pts in body.items():
+                cand = tree.query(Polygon(near[part]), predicate="intersects")
+                if not len(cand):
+                    continue
                 poly = Polygon(pts)
-                hits = tree.query(poly, predicate="intersects")
-                if len(hits):
-                    hit_parts.add(part)
-                    if part not in open_events:
-                        inter = poly.intersection(lines[int(hits[0])])
-                        p = inter.representative_point() if not inter.is_empty else poly.centroid
-                        ev = Collision(part, p.x, p.y, float(sim.dist[i]), float(sim.dist[i]),
-                                       int(sim.leg[i]))
-                        open_events[part] = ev
-                        collisions.append(ev)
+                gaps = shapely.distance(poly, line_arr[cand])
+                j = int(np.argmin(gaps))
+                gap = float(gaps[j])
+                if min_gap is None or gap < min_gap:
+                    min_gap = gap
+                    q = shapely.ops.nearest_points(poly, line_arr[cand[j]])[1]
+                    min_gap_at = (q.x, q.y, float(sim.dist[i]))
+                if gap >= co.clearance - 1e-9 and gap > 0:
+                    continue
+                hit_parts.add(part)
+                ev = open_events.get(part)
+                if ev is None:
+                    line = line_arr[cand[j]]
+                    inter = poly.intersection(line) if gap <= 0 else None
+                    if inter is not None and not inter.is_empty:
+                        p = inter.representative_point()
                     else:
-                        open_events[part].dist_to = float(sim.dist[i])
+                        p = shapely.ops.nearest_points(poly, line)[1]
+                    ev = Collision(part, p.x, p.y, float(sim.dist[i]), float(sim.dist[i]), int(sim.leg[i]),
+                                   contact=gap <= 0, min_gap=gap)
+                    open_events[part] = ev
+                    collisions.append(ev)
+                else:
+                    ev.dist_to = float(sim.dist[i])
+                    if gap < ev.min_gap:
+                        ev.min_gap = gap
+                    if gap <= 0 and not ev.contact:
+                        # 여유폭 부족으로 시작했다가 실제로 닿음 → 닿은 위치로 바꿈
+                        ev.contact = True
+                        inter = poly.intersection(line_arr[cand[j]])
+                        if not inter.is_empty:
+                            p = inter.representative_point()
+                            ev.x, ev.y = p.x, p.y
             for part in list(open_events):
                 if part not in hit_parts:
                     del open_events[part]
-    if collisions:
-        reasons.append(
-            f"장애물과 충돌 또는 여유폭({co.clearance:.2f} m) 부족 {len(collisions)}곳"
-        )
+    n_contact = sum(1 for c in collisions if c.contact)
+    n_clear = len(collisions) - n_contact
+    if n_contact:
+        reasons.append(f"장애물과 충돌 {n_contact}곳")
+    if n_clear:
+        reasons.append(f"여유폭({co.clearance:.2f} m) 부족 {n_clear}곳 (닿지는 않음)")
 
     # ---------------- 주행 결과 ----------------
     if sim.jackknife_at is not None:
@@ -226,4 +286,5 @@ def analyze(vehicle: Vehicle, sim: SimResult, lines: list[LineString], tree: STR
         tracks=tracks, snapshots=snapshots,
         max_steer_deg=float(np.degrees(np.max(np.abs(sim.steer)))) if len(sim.steer) else 0.0,
         max_articulation_deg=max_art,
+        min_gap=min_gap, min_gap_at=min_gap_at, gap_probe=probe,
     )

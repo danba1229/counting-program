@@ -39,10 +39,24 @@ _U_ESCAPE = re.compile(r"\\U\+([0-9A-Fa-f]{4})")
 CACHE_VERSION = 5
 CACHE_KEEP = 20  # 캐시 파일 최대 개수 (오래된 것부터 삭제)
 
-# 기본으로 장애물에서 제외할 레이어 이름 패턴
+# 기본으로 장애물에서 제외할 레이어 이름 패턴.
+# 차량이 그 위로 지나가는 바닥 표시, 계획·경계선, 지형, 검토용 선, 글자·해치처럼 세워진 물체가 아닌 것.
+# (실제 단지배치도 4종의 레이어 이름을 보고 정함. 사용자는 화면에서 언제든 바꿀 수 있다.)
 NON_OBSTACLE_PATTERN = re.compile(
-    r"(DIM|TEXT|TXT|ANNO|HATCH|PAT|CEN|DEFPOINTS|GRID|AXIS|TITLE|FRAME|BORDER|SYMB|MARK|"
-    r"치수|문자|글자|해치|중심|그리드|도곽|기호|주기|주차구획)",
+    "(" + "|".join([
+        # 글자·치수·해치·기준선
+        r"DIM", r"TEXT", r"TXT", r"TEX", r"ANNO", r"HATCH", r"HAT", r"PAT", r"CEN", r"DEFPOINT", r"DEPOINT",
+        r"GRID", r"AXIS", r"TITLE", r"FRAME", r"BORDER", r"SYMB", r"MARK", r"GUIDE", r"CHECK", r"AREA",
+        r"LEVEL", r"치수", r"문자", r"글자", r"해치", r"패턴", r"중심", r"그리드", r"도곽", r"기호", r"주기",
+        r"지명", r"범례", r"면적", r"동딱지",
+        # 바닥에 그린 것 (차량이 위로 지나감)
+        r"주차구획", r"주차면", r"노상주차", r"노면", r"차선", r"중앙선", r"정지선", r"횡단보도", r"횡단도",
+        r"도색", r"유색포장", r"포장", r"점자", r"점형", r"과속방지턱", r"험프", r"고원식", r"소방차",
+        r"도로폭", r"동선",
+        # 계획·경계선, 지형, 검토용 선
+        r"계획선", r"경계선", r"대지경계", r"구역", r"지역", r"건축한계", r"지구단위", r"도시계획", r"토지이용",
+        r"획지", r"지적", r"등고선", r"레벨", r"계획고", r"검토", r"안전거리", r"지하주차장",
+    ]) + ")",
     re.IGNORECASE,
 )
 
