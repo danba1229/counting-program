@@ -77,30 +77,53 @@ class GstarCadError(Exception):
     pass
 
 
-def is_installed() -> bool:
-    """GstarCAD COM 자동화가 등록되어 있는지 확인."""
+def prog_ids() -> list[str]:
+    """등록된 GstarCAD COM 이름을 최신 버전부터 돌려준다.
+
+    버전 없는 'GStarCAD.Application' 은 여러 버전이 깔려 있으면 옛 버전(예: 2022)을
+    가리킬 수 있어서, 'GStarCAD.Application.23' 처럼 버전 붙은 이름을 먼저 쓴다.
+    """
     if sys.platform != "win32":
-        return False
+        return []
     import winreg
 
-    for pid in PROG_IDS:
+    def registered(name: str) -> bool:
         try:
-            winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, pid + r"\CLSID"))
+            winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, name + r"\CLSID"))
             return True
         except OSError:
-            continue
-    return False
+            return False
+
+    found = []
+    for ver in range(40, 14, -1):
+        for base in PROG_IDS:
+            if registered(f"{base}.{ver}"):
+                found.append(f"{base}.{ver}")
+    found += [p for p in PROG_IDS if registered(p)]
+    return found
+
+
+def is_installed() -> bool:
+    """GstarCAD COM 자동화가 등록되어 있는지 확인."""
+    return bool(prog_ids())
 
 
 def convert_to_dxf(dwg: str | Path, dxf: str | Path | None = None, timeout: float = TIMEOUT_S) -> Path:
     """DWG 를 DXF 로 변환해 그 경로를 돌려준다. dxf 를 생략하면 임시 폴더에 만든다."""
     dwg = Path(dwg).resolve()
     if dxf is None:
-        dxf = Path(tempfile.mkdtemp(prefix="spc_gstar_")) / (dwg.stem + ".dxf")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="spc_gstar_"))
+        try:
+            return convert_to_dxf(dwg, tmp_dir / (dwg.stem + ".dxf"), timeout)
+        except BaseException:
+            import shutil
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
     dxf = Path(dxf).resolve()
     dxf.unlink(missing_ok=True)
     env = dict(os.environ, SPC_DWG_SRC=str(dwg), SPC_DXF_DST=str(dxf),
-               SPC_SAVE_TYPE=str(DXF_SAVE_TYPE), SPC_PROG_IDS=",".join(PROG_IDS))
+               SPC_SAVE_TYPE=str(DXF_SAVE_TYPE), SPC_PROG_IDS=",".join(prog_ids() or PROG_IDS))
     encoded = base64.b64encode(_SCRIPT.encode("utf-16-le")).decode("ascii")
     try:
         proc = subprocess.run(
