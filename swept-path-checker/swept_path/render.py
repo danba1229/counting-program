@@ -29,7 +29,11 @@ class DrawingRenderer:
         vx0, vx1 = (-2 - tx) / k, (width + 2 - tx) / k
         vy0, vy1 = (ty - height - 2) / k, (ty + 2) / k
         bb = d.bboxes
-        return (bb[:, 2] >= vx0) & (bb[:, 0] <= vx1) & (bb[:, 3] >= vy0) & (bb[:, 1] <= vy1)
+        vis = (bb[:, 2] >= vx0) & (bb[:, 0] <= vx1) & (bb[:, 3] >= vy0) & (bb[:, 1] <= vy1)
+        removed = d.removed  # 한 번만 읽는다 (다른 스레드에서 교체될 수 있음)
+        if removed is not None and len(removed) == len(vis):
+            vis &= ~removed
+        return vis
 
     def visible_count(self, width: int, height: int, s: float, tx: float, ty: float) -> int:
         if self.d.bboxes is None or len(self.d.bboxes) == 0:

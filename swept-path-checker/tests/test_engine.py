@@ -399,3 +399,47 @@ def test_pdf_and_png_report(sample, tmp_path):
     assert img.size == report.PAGE
     arr = np.asarray(img.convert("RGB"))
     assert ((arr[:, :, 2] > 200) & (arr[:, :, 0] < 80)).sum() > 500  # 파란 궤적 외곽선이 그려짐
+
+
+def test_removed_lines_are_excluded_everywhere(sample):
+    from swept_path.render import DrawingRenderer
+
+    d = load_drawing(sample)
+    n = len(d.polylines)
+    obs_layers = d.default_obstacle_layers()
+    n_obs = len(d.polylines_m(obs_layers))
+    pillars = d.layer_lines("기둥")
+    assert len(pillars) == 4
+    assert len(d.set_removed(pillars)) == 4
+    assert len(d.set_removed(pillars)) == 0  # 이미 지운 선은 다시 바뀌지 않음
+    assert d.removed_count == 4 and len(d.polylines) == n  # 원본 배열은 그대로
+    assert len(d.polylines_m(obs_layers)) == n_obs - 4
+    assert len(d.layer_lines("기둥")) == 0 and len(d.layer_lines("기둥", include_removed=True)) == 4
+    assert d.active_layer_counts()["기둥"] == 0 and d.layer_counts["기둥"] == 4
+    # 지운 선은 선 고르기·화면 그리기에서도 빠진다
+    k = d.unit_scale
+    p = d.verts[d.offsets[pillars[0]]]
+    assert d.nearest_polyline(p[0], p[1], 0.05 / k) not in set(pillars.tolist())
+    r = DrawingRenderer(d)
+    assert r.visible_count(800, 600, 10.0, 100.0, 500.0) <= n - 4
+    # 구간 저장 → 다시 적용
+    ranges = d.removed_ranges()
+    d.restore_all()
+    assert d.removed_count == 0
+    assert d.apply_removed_ranges(ranges) == 4
+    assert set(np.nonzero(d.removed)[0].tolist()) == set(pillars.tolist())
+    # 사각형 안에 완전히 들어간 선만
+    x0, y0, x1, y1 = (v / k for v in d.bounds_m())
+    assert len(d.lines_in_rect(x0 - 1, y0 - 1, x1 + 1, y1 + 1)) == n - 4
+    assert len(d.lines_in_rect(x0, y0, x0 + 1e-6, y0 + 1e-6)) == 0
+
+
+def test_removing_pillars_changes_verdict(sample):
+    d = load_drawing(sample)
+    sc = Scenario(18, 3.5, 0, [Waypoint(30, 3.5), Waypoint(36.5, 10),
+                               Waypoint(36.5, 32, FORWARD, math.pi / 2)])
+    before = run_check(VEHICLES["semitrailer"], sc, d.polylines_m(d.default_obstacle_layers()))
+    d.set_removed(d.layer_lines("기둥"))
+    after = run_check(VEHICLES["semitrailer"], sc, d.polylines_m(d.default_obstacle_layers()))
+    # 기둥에 먼저 부딪히던 차량이, 기둥을 지우면 더 가서(다른 곳에서) 부딪히거나 통과한다
+    assert after.feasible or after.collisions[0].dist_from > before.collisions[0].dist_from + 1.0

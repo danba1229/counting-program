@@ -108,6 +108,9 @@ class Drawing:
     bboxes: np.ndarray | None = None  # (N,4) xmin, ymin, xmax, ymax (도면 단위)
     layer_index: np.ndarray | None = None  # (N,) layer_names 위치
     layer_names: list[str] = field(default_factory=list)
+    # 프로그램 안에서 지운 선 (원본 파일은 그대로). 화면·충돌 검사·선 고르기에서 빠진다.
+    # 백그라운드 그리기와 겹쳐도 안전하도록 바꿀 때마다 새 배열로 교체한다.
+    removed: np.ndarray | None = None  # (N,) bool
 
     def build_index(self) -> None:
         """polylines / layers 목록 → 배열 색인."""
@@ -139,14 +142,88 @@ class Drawing:
         self.layer_counts = {name: int(c) for name, c in zip(self.layer_names, counts) if c}
         self.polylines = _PolylineView(self.verts, self.offsets)
         self.layers = _LayerView(self.layer_index, self.layer_names)
+        self.removed = np.zeros(n, dtype=bool)
+
+    # ---------------- 프로그램 안에서 선 지우기 ----------------
+    def set_removed(self, indices, removed: bool = True) -> np.ndarray:
+        """선을 지우거나(removed=True) 되살린다. 실제로 상태가 바뀐 선 번호를 돌려준다."""
+        if self.bboxes is None:
+            self.build_index()
+        idx = np.unique(np.asarray(indices, dtype=np.int64).ravel())
+        idx = idx[(idx >= 0) & (idx < len(self.removed))]
+        idx = idx[self.removed[idx] != removed]
+        if len(idx):
+            new = self.removed.copy()
+            new[idx] = removed
+            self.removed = new
+        return idx
+
+    def restore_all(self) -> np.ndarray:
+        """지운 선을 모두 되살린다. 되살린 선 번호를 돌려준다."""
+        return self.set_removed(np.nonzero(self.removed)[0], False)
+
+    @property
+    def removed_count(self) -> int:
+        return 0 if self.removed is None else int(np.count_nonzero(self.removed))
+
+    def layer_lines(self, name: str, include_removed: bool = False) -> np.ndarray:
+        """레이어의 선 번호."""
+        if name not in self.layer_names:
+            return np.zeros(0, dtype=np.int64)
+        mask = self.layer_index == self.layer_names.index(name)
+        if not include_removed:
+            mask &= ~self.removed
+        return np.nonzero(mask)[0]
+
+    def lines_in_rect(self, x0: float, y0: float, x1: float, y1: float) -> np.ndarray:
+        """사각형 [도면 단위] 안에 완전히 들어가는 (지우지 않은) 선 번호."""
+        if self.bboxes is None or not len(self.bboxes):
+            return np.zeros(0, dtype=np.int64)
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        bb = self.bboxes
+        mask = (bb[:, 0] >= x0) & (bb[:, 2] <= x1) & (bb[:, 1] >= y0) & (bb[:, 3] <= y1) & ~self.removed
+        return np.nonzero(mask)[0]
+
+    def active_layer_counts(self) -> dict[str, int]:
+        """지우지 않은 선 기준 레이어별 선 개수 (모두 지운 레이어는 0)."""
+        if self.layer_index is None or not len(self.layer_index):
+            return {name: 0 for name in self.layer_counts}
+        counts = np.bincount(self.layer_index[~self.removed], minlength=len(self.layer_names))
+        return {name: int(counts[i]) for i, name in enumerate(self.layer_names) if name in self.layer_counts}
+
+    def removed_ranges(self) -> list[list[int]]:
+        """지운 선 번호를 [시작, 끝(포함)] 구간 목록으로 (작업 파일 저장용)."""
+        idx = np.nonzero(self.removed)[0] if self.removed is not None else np.zeros(0, dtype=np.int64)
+        if not len(idx):
+            return []
+        breaks = np.nonzero(np.diff(idx) > 1)[0]
+        starts = np.concatenate([[idx[0]], idx[breaks + 1]])
+        ends = np.concatenate([idx[breaks], [idx[-1]]])
+        return [[int(a), int(b)] for a, b in zip(starts.tolist(), ends.tolist())]
+
+    def apply_removed_ranges(self, ranges) -> int:
+        """removed_ranges() 로 저장한 구간을 적용한다. 지운 선 개수를 돌려준다."""
+        if self.bboxes is None:
+            self.build_index()
+        new = np.zeros(len(self.layer_index), dtype=bool)
+        for a, b in ranges:
+            a, b = max(int(a), 0), min(int(b), len(new) - 1)
+            if a <= b:
+                new[a:b + 1] = True
+        self.removed = new
+        return int(np.count_nonzero(new))
 
     def bounds_m(self) -> tuple[float, float, float, float] | None:
         if not self.polylines:
             return None
         if self.bboxes is None:
             self.build_index()
-        lo = self.bboxes[:, :2].min(axis=0) * self.unit_scale
-        hi = self.bboxes[:, 2:].max(axis=0) * self.unit_scale
+        bb = self.bboxes[~self.removed] if self.removed is not None and self.removed.any() else self.bboxes
+        if not len(bb):
+            return None
+        lo = bb[:, :2].min(axis=0) * self.unit_scale
+        hi = bb[:, 2:].max(axis=0) * self.unit_scale
         return float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1])
 
     def nearest_polyline(self, x: float, y: float, tol: float) -> int | None:
@@ -155,7 +232,7 @@ class Drawing:
             return None
         bb = self.bboxes
         cand = np.nonzero((bb[:, 0] - tol <= x) & (bb[:, 2] + tol >= x) &
-                          (bb[:, 1] - tol <= y) & (bb[:, 3] + tol >= y))[0]
+                          (bb[:, 1] - tol <= y) & (bb[:, 3] + tol >= y) & ~self.removed)[0]
         if not len(cand):
             return None
         best, best_d = None, tol
@@ -179,8 +256,7 @@ class Drawing:
         """m 단위 폴리라인. layers: 이 레이어만 / bbox_m: 이 범위(xmin, ymin, xmax, ymax)에 걸친 것만."""
         if self.bboxes is None:
             self.build_index()
-        n = len(self.layer_index)
-        mask = np.ones(n, dtype=bool)
+        mask = ~self.removed
         if layers is not None:
             flags = np.array([name in layers for name in self.layer_names], dtype=bool)
             mask &= flags[self.layer_index] if len(flags) else False

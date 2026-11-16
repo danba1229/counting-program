@@ -198,3 +198,68 @@ def test_step_marks_and_empty_state(gui):
     assert a.empty_state.winfo_manager() == ""
     assert a.nb.tab(0, "text").startswith("✓")
     assert not a.nb.tab(2, "text").startswith("✓")  # 경로 아직 없음
+
+
+def test_erase_line_layer_rect_and_undo(gui_with_sample):
+    a, appmod = gui_with_sample
+    d = a.drawing
+    n_park = d.layer_counts["주차구획"]
+    a.start_erase_mode()
+    assert a.tool_var.get() == appmod.TOOL_ERASE
+    cx, cy = a.w2c(1.0, 9.0)  # 주차구획선 x=1.0 m
+    a._on_motion(E(cx + 3, cy))
+    assert a.canvas.find_withtag("erasehl")
+    click(a, cx + 3, cy)
+    assert d.removed_count == 1
+    assert len(d.layer_lines("주차구획")) == n_park - 1
+    assert "지움 1" in a.layer_list.get(a._layer_view.index("주차구획"))
+    assert str(a.restore_btn.cget("state")) == "normal"
+    a.undo()
+    assert d.removed_count == 0
+    # Shift+클릭: 레이어 전체
+    a._on_press(E(cx + 3, cy, 0x0001))
+    a._on_release(E(cx + 3, cy, 0x0001))
+    assert d.removed_count == n_park
+    assert "모두 지움" in a.layer_list.get(a._layer_view.index("주차구획"))
+    # 지운 선은 다시 고를 수 없음 → 빈 곳 클릭과 같음
+    click(a, cx + 3, cy)
+    assert d.removed_count == n_park
+    a.undo()
+    assert d.removed_count == 0
+    # 끌기: 사각형 안에 완전히 들어간 선 (기둥 4개 + 주차구획 등). 화면 전체를 감싸면 모두
+    x0, y0, x1, y1 = d.bounds_m()
+    drag(a, *a.w2c(x0 - 1, y1 + 1), *a.w2c(x1 + 1, y0 - 1))
+    assert d.removed_count == len(d.polylines)
+    a.restore_all_lines()
+    assert d.removed_count == 0 and str(a.restore_btn.cget("state")) == "disabled"
+    # 경로 되돌리기와 섞여도 순서대로 되돌린다
+    make_path(a, appmod)
+    a.tool_var.set(appmod.TOOL_ERASE)
+    click(a, cx + 3, cy)
+    n_wp = len(a.waypoints)
+    a.undo()  # 선 지우기 취소
+    assert d.removed_count == 0 and len(a.waypoints) == n_wp
+    a.undo()  # 목적지 취소
+    assert a.dest is None
+
+
+def test_erase_layer_from_list_and_obstacles(gui_with_sample):
+    a, appmod = gui_with_sample
+    a.erase_layer("기둥")
+    assert a.drawing.removed_count == 4
+    assert len(a._obstacles()[0]) == len(a.drawing.polylines_m({"벽"}))  # 기둥 선은 장애물에서 빠짐
+    a.restore_layer("기둥")
+    assert a.drawing.removed_count == 0
+
+
+def test_project_saves_removed_lines(gui_with_sample, tmp_path, monkeypatch):
+    a, appmod = gui_with_sample
+    a.erase_layer("기둥")
+    p = tmp_path / "work.json"
+    monkeypatch.setattr(appmod.filedialog, "asksaveasfilename", lambda **k: str(p))
+    monkeypatch.setattr(appmod.filedialog, "askopenfilename", lambda **k: str(p))
+    a.save_project()
+    a.restore_all_lines()
+    a.load_project()
+    assert a.drawing.removed_count == 4
+    assert len(a.drawing.layer_lines("기둥")) == 0

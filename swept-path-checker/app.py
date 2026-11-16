@@ -68,8 +68,18 @@ ASYNC_RENDER_LINES = 30000  # 화면에 보이는 선이 이보다 많으면 백
 
 TOOL_START, TOOL_WAYPOINT, TOOL_DEST, TOOL_PAN = "start", "waypoint", "dest", "pan"
 TOOL_PICK = "pick"  # 도면의 선을 클릭해 장애물 레이어 켜기/끄기
+TOOL_ERASE = "erase"  # 도면의 선을 프로그램 안에서 지우기 (원본 파일은 그대로)
 PICK_PX = 8  # 선 고르기 거리 (화면 px)
 PICK_HIGHLIGHT_MAX = 4000  # 강조 표시할 같은 레이어 선 최대 개수
+COLOR_ERASE = "#e11d48"  # 지울 선 강조색
+MUTED_LIST = "#9ca3af"  # 모두 지운 레이어 목록 글자색
+
+
+class _LinesUndo:
+    """되돌리기 기록: 선 지우기/되살리기 한 번."""
+
+    def __init__(self, drawing: Drawing, indices: np.ndarray, removed: bool):
+        self.drawing, self.indices, self.removed = drawing, indices, removed
 
 VEHICLE_FIELDS = [
     ("name", "차량 이름", str),
@@ -209,6 +219,8 @@ class SweptPathApp:
         TOOL_DEST: "목적지: 클릭하거나, 누른 채 끌어서 도착 방향까지 지정하세요.",
         TOOL_PAN: "화면 이동: 끌어서 이동, 휠로 확대·축소. (다른 도구에서도 휠 버튼·오른쪽 버튼으로 이동)",
         TOOL_PICK: "레이어 고르기: 선 위에 마우스를 올리면 같은 레이어가 주황색으로 표시됩니다. 클릭 = 장애물 켜기/끄기",
+        TOOL_ERASE: "선 지우기: 클릭 = 선 1개, Shift+클릭 = 그 레이어 전체, 끌기 = 사각형 안에 완전히 들어간 선. "
+                    "원본 도면은 바뀌지 않으며 Ctrl+Z로 되돌립니다.",
     }
 
     def _build_toolbar(self, parent) -> None:
@@ -216,8 +228,9 @@ class SweptPathApp:
         tb.pack(fill=tk.X, pady=(0, 6))
         self.tool_var = tk.StringVar(value=TOOL_START)
         self.tool_var.trace_add("write", lambda *_: self._on_tool_change())
-        for text, val in (("●  출발점", TOOL_START), ("◆  경유점", TOOL_WAYPOINT), ("⚑  목적지", TOOL_DEST),
-                          ("✋  이동", TOOL_PAN), ("▤  레이어 고르기", TOOL_PICK)):
+        # 1366 px 폭 화면에서도 '후진'까지 잘리지 않도록 글자를 짧게 유지한다.
+        for text, val in (("● 출발점", TOOL_START), ("◆ 경유점", TOOL_WAYPOINT), ("⚑ 목적지", TOOL_DEST),
+                          ("✋ 이동", TOOL_PAN), ("▤ 레이어 고르기", TOOL_PICK), ("✂ 지우기", TOOL_ERASE)):
             ttk.Radiobutton(tb, text=text, value=val, variable=self.tool_var, style="Tool.TRadiobutton",
                             takefocus=False).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Separator(tb, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
@@ -338,6 +351,15 @@ class SweptPathApp:
             side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
         ttk.Button(pf, text="레이어 설정 불러오기", style="Small.TButton", command=self.load_layer_preset).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
+        erow = ttk.Frame(c2, style="Inner.TFrame")
+        erow.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Button(erow, text="✂  도면에서 선 지우기", style="Small.TButton", command=self.start_erase_mode).pack(
+            side=tk.LEFT, padx=(0, 4))
+        self.restore_btn = ttk.Button(erow, text="지운 선 모두 복원", style="Small.TButton",
+                                      command=self.restore_all_lines, state="disabled")
+        self.restore_btn.pack(side=tk.LEFT)
+        self.erase_count_var = tk.StringVar(value="")
+        ttk.Label(erow, textvariable=self.erase_count_var, style="CardMuted.TLabel").pack(side=tk.RIGHT)
         ttk.Button(c2, text="▤  도면에서 클릭해 장애물 레이어 켜기/끄기", command=self.start_pick_mode).pack(
             side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         btns = ttk.Frame(c2, style="Inner.TFrame")
@@ -354,6 +376,8 @@ class SweptPathApp:
         self.layer_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.layer_list.bind("<<ListboxSelect>>", lambda e: self._on_layer_select())
+        self.layer_list.bind("<Button-3>", self._layer_menu)  # 오른쪽 클릭: 레이어 지우기/되살리기
+        self.layer_list.bind("<Button-2>", self._layer_menu)  # macOS
 
     # ---------------- 차량 탭 ----------------
     def _build_vehicle_tab(self) -> None:
@@ -526,6 +550,9 @@ class SweptPathApp:
             "",
             "마우스 휠: 확대·축소 / 휠 버튼·오른쪽 버튼 끌기: 화면 이동",
             "찍은 점 끌기: 위치 이동 / 화살표 끝 끌기: 방향 수정 (Shift: 15° 단위)",
+            "",
+            "✂ 선 지우기: 클릭 = 선 1개, Shift+클릭 = 레이어 전체, 끌기 = 사각형 안의 선",
+            "레이어 목록 오른쪽 클릭: 레이어 지우기·되살리기 (원본 도면 파일은 바뀌지 않음)",
         ]))
 
     # ==================================================================
@@ -594,17 +621,26 @@ class SweptPathApp:
     def _on_motion(self, e) -> None:
         x, y = self.c2w(e.x, e.y)
         self.coord_var.set(f"x = {x:,.2f} m   y = {y:,.2f} m")
-        if self.tool_var.get() == TOOL_PICK:
+        tool = self.tool_var.get()
+        if tool == TOOL_PICK:
             self._pick_hover(e.x, e.y)
+        elif tool == TOOL_ERASE and not self._drag:
+            self._erase_hover(e.x, e.y, bool(e.state & 0x0001))
 
     # ---------------- 도면에서 레이어 고르기 ----------------
     def _on_tool_change(self) -> None:
+        tool = self.tool_var.get()
         if hasattr(self, "hint_var"):
-            self.hint_var.set(self.TOOL_HINTS.get(self.tool_var.get(), ""))
-        if self.tool_var.get() != TOOL_PICK and hasattr(self, "canvas"):
-            self.canvas.delete("pickhl")
-            self.canvas.config(cursor="crosshair")
-            self._pick_layer = None
+            self.hint_var.set(self.TOOL_HINTS.get(tool, ""))
+        if hasattr(self, "canvas"):
+            if tool != TOOL_PICK:
+                self.canvas.delete("pickhl")
+                self._pick_layer = None
+            if tool != TOOL_ERASE:
+                self.canvas.delete("erasehl")
+                self._erase_key = None
+            if tool not in (TOOL_PICK, TOOL_ERASE):
+                self.canvas.config(cursor="crosshair")
 
     def start_pick_mode(self) -> None:
         if not self.drawing:
@@ -635,19 +671,7 @@ class SweptPathApp:
             return
         self.canvas.config(cursor="hand2")
         d = self.drawing
-        li = d.layer_names.index(layer)
-        vis = self.renderer._visible(max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1),
-                                     self.s, self.tx, self.ty) if self.renderer else None
-        mask = d.layer_index == li
-        if vis is not None:
-            mask &= vis
-        ids = np.nonzero(mask)[0][:PICK_HIGHLIGHT_MAX]
-        k = d.unit_scale
-        for i in ids:
-            pts = d.verts[d.offsets[i]:d.offsets[i + 1]] * k
-            self.canvas.create_line(self._flat(pts), fill="#ff8c00", width=3, tags=("world", "pickhl"))
-        self.canvas.tag_raise("path")
-        self.canvas.tag_raise("result")
+        self._highlight_lines(d.layer_lines(layer), "#ff8c00", "pickhl")
         state = "장애물" if layer in self.obstacle_layers else "장애물 아님"
         self.set_status(f"레이어: {layer}  (선 {d.layer_counts[layer]:,}개)  현재 {state}  → 클릭하면 전환")
 
@@ -677,6 +701,160 @@ class SweptPathApp:
         self._pick_hover(cx, cy)
         self.set_status(f"'{layer}' 레이어를 {'장애물로 지정' if on else '장애물에서 제외'}했습니다. "
                         f"(장애물 레이어 {len(self.obstacle_layers)}개)")
+
+    def _highlight_lines(self, ids: np.ndarray, color: str, tag: str) -> None:
+        """선 번호 목록 중 화면에 보이는 것만 굵게 강조 (너무 많으면 앞쪽 일부만)."""
+        d = self.drawing
+        if self.renderer is not None and len(ids):
+            vis = self.renderer._visible(max(self.canvas.winfo_width(), 1), max(self.canvas.winfo_height(), 1),
+                                         self.s, self.tx, self.ty)
+            ids = ids[vis[ids]]
+        k = d.unit_scale
+        for i in ids[:PICK_HIGHLIGHT_MAX].tolist():
+            pts = d.verts[d.offsets[i]:d.offsets[i + 1]] * k
+            self.canvas.create_line(self._flat(pts), fill=color, width=3, tags=("world", tag))
+        self.canvas.tag_raise("path")
+        self.canvas.tag_raise("result")
+
+    # ---------------- 도면에서 선 지우기 ----------------
+    def start_erase_mode(self) -> None:
+        if not self.drawing:
+            messagebox.showinfo("안내", "먼저 도면을 여세요.")
+            return
+        self.tool_var.set(TOOL_ERASE)
+        self.set_status("지울 선 위를 클릭하세요. Shift+클릭은 레이어 전체, 끌기는 사각형 안의 선을 지웁니다. "
+                        "원본 도면 파일은 바뀌지 않습니다.")
+
+    def _pick_line(self, cx: float, cy: float) -> int | None:
+        """화면 좌표 근처 (지우지 않은) 선 번호."""
+        d = self.drawing
+        if d is None:
+            return None
+        x, y = self.c2w(cx, cy)
+        k = d.unit_scale
+        return d.nearest_polyline(x / k, y / k, PICK_PX / (self.s * k))
+
+    def _erase_hover(self, cx: float, cy: float, whole_layer: bool) -> None:
+        i = self._pick_line(cx, cy)
+        d = self.drawing
+        key = None if i is None else (("layer", d.layers[i]) if whole_layer else ("line", i))
+        if key == getattr(self, "_erase_key", None):
+            return
+        self._erase_key = key
+        self.canvas.delete("erasehl")
+        if key is None:
+            self.canvas.config(cursor="crosshair")
+            return
+        self.canvas.config(cursor="X_cursor")
+        layer = d.layers[i]
+        if whole_layer:
+            ids = d.layer_lines(layer)
+            self._highlight_lines(ids, COLOR_ERASE, "erasehl")
+            self.set_status(f"레이어 '{layer}' 선 {len(ids):,}개  → Shift+클릭하면 모두 지웁니다")
+        else:
+            self._highlight_lines(np.array([i]), COLOR_ERASE, "erasehl")
+            self.set_status(f"선 1개 (레이어 '{layer}')  → 클릭하면 지웁니다.  Shift+클릭: 레이어 전체")
+
+    def erase_lines(self, indices, what: str = "") -> int:
+        """선을 지운다 (되돌리기 가능). 지운 개수를 돌려준다."""
+        if not self.drawing:
+            return 0
+        changed = self.drawing.set_removed(indices, True)
+        if len(changed):
+            self._undo.append(_LinesUndo(self.drawing, changed, True))
+            del self._undo[:-100]
+            self._lines_changed()
+            self.set_status(f"{what}선 {len(changed):,}개를 지웠습니다. (되돌리기 Ctrl+Z · 지운 선 모두 "
+                            f"{self.drawing.removed_count:,}개)")
+        else:
+            self.set_status("지울 선이 없습니다.")
+        return len(changed)
+
+    def restore_lines(self, indices, what: str = "") -> int:
+        if not self.drawing:
+            return 0
+        changed = self.drawing.set_removed(indices, False)
+        if len(changed):
+            self._undo.append(_LinesUndo(self.drawing, changed, False))
+            del self._undo[:-100]
+            self._lines_changed()
+            self.set_status(f"{what}선 {len(changed):,}개를 되살렸습니다. (남은 지운 선 {self.drawing.removed_count:,}개)")
+        return len(changed)
+
+    def restore_all_lines(self) -> None:
+        if self.drawing and self.drawing.removed_count:
+            self.restore_lines(np.nonzero(self.drawing.removed)[0], "지운 ")
+
+    def erase_layer(self, layer: str) -> int:
+        return self.erase_lines(self.drawing.layer_lines(layer), f"레이어 '{layer}'의 ") if self.drawing else 0
+
+    def restore_layer(self, layer: str) -> int:
+        if not self.drawing:
+            return 0
+        ids = self.drawing.layer_lines(layer, include_removed=True)
+        return self.restore_lines(ids[self.drawing.removed[ids]], f"레이어 '{layer}'의 ")
+
+    def _lines_changed(self) -> None:
+        """지운 선이 바뀌었을 때: 장애물·화면·레이어 목록 갱신."""
+        self._obstacle_cache = None
+        self._erase_key = None
+        self.canvas.delete("erasehl")
+        self.canvas.delete("pickhl")
+        self._pick_layer = None
+        self.clear_results()
+        self._fill_layer_list()
+        self.render_drawing()
+
+    def _update_erase_count(self) -> None:
+        if not hasattr(self, "erase_count_var"):
+            return
+        n = self.drawing.removed_count if self.drawing else 0
+        self.erase_count_var.set(f"지운 선 {n:,}개" if n else "")
+        self.restore_btn.config(state="normal" if n else "disabled")
+
+    def _erase_click(self, cx: float, cy: float, whole_layer: bool) -> None:
+        i = self._pick_line(cx, cy)
+        if i is None:
+            self.set_status("근처에 선이 없습니다. 선 위를 클릭하거나, 끌어서 사각형으로 고르세요.")
+            return
+        if whole_layer:
+            self.erase_layer(self.drawing.layers[i])
+        else:
+            self.erase_lines([i], f"레이어 '{self.drawing.layers[i]}'의 ")
+        self._erase_hover(cx, cy, whole_layer)
+
+    def _erase_rect(self, c0: tuple[float, float], c1: tuple[float, float]) -> None:
+        k = self.drawing.unit_scale
+        (x0, y0), (x1, y1) = self.c2w(*c0), self.c2w(*c1)
+        ids = self.drawing.lines_in_rect(x0 / k, y0 / k, x1 / k, y1 / k)
+        if len(ids):
+            self.erase_lines(ids, "사각형 안의 ")
+        else:
+            self.set_status("사각형 안에 완전히 들어간 선이 없습니다.")
+
+    def _layer_menu(self, e) -> None:
+        """레이어 목록 오른쪽 클릭 메뉴."""
+        if not self.drawing:
+            return
+        view = getattr(self, "_layer_view", self.layer_names)
+        i = self.layer_list.nearest(e.y)
+        if not 0 <= i < len(view):
+            return
+        bbox = self.layer_list.bbox(i)
+        if bbox is None or not bbox[1] <= e.y <= bbox[1] + bbox[3]:
+            return  # 목록 아래 빈 곳
+        layer = view[i]
+        active = len(self.drawing.layer_lines(layer))
+        gone = self.drawing.layer_counts.get(layer, 0) - active
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"'{layer}' 레이어 지우기 (선 {active:,}개)",
+                         command=lambda: self.erase_layer(layer), state="normal" if active else "disabled")
+        menu.add_command(label=f"'{layer}' 레이어 되살리기 (선 {gone:,}개)",
+                         command=lambda: self.restore_layer(layer), state="normal" if gone else "disabled")
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
 
     # ---------------- 레이어 설정 저장/불러오기 ----------------
     def save_layer_preset(self) -> None:
@@ -807,10 +985,19 @@ class SweptPathApp:
         del self._undo[:-100]  # 최근 100단계까지
 
     def undo(self) -> None:
+        while self._undo and isinstance(self._undo[-1], _LinesUndo) and self._undo[-1].drawing is not self.drawing:
+            self._undo.pop()  # 다른(이전에 연) 도면의 선 지우기 기록은 건너뜀
         if not self._undo:
             self.set_status("되돌릴 작업이 없습니다.")
             return
-        self.start, self.waypoints, self.dest = self._undo.pop()
+        entry = self._undo.pop()
+        if isinstance(entry, _LinesUndo):
+            self.drawing.set_removed(entry.indices, not entry.removed)
+            self._lines_changed()
+            done = "지운 선" if entry.removed else "되살린 선"
+            self.set_status(f"{done} {len(entry.indices):,}개를 되돌렸습니다. (남은 되돌리기 {len(self._undo)}단계)")
+            return
+        self.start, self.waypoints, self.dest = entry
         self._path_changed()
         self.set_status(f"되돌렸습니다. (남은 되돌리기 {len(self._undo)}단계)")
 
@@ -856,6 +1043,12 @@ class SweptPathApp:
         if tool == TOOL_PICK:
             self._pick_click(e.x, e.y)
             return
+        if tool == TOOL_ERASE:
+            if self.drawing:
+                self._drag = (tool, e.x, e.y, e.x, e.y, bool(e.state & 0x0001))
+            else:
+                messagebox.showinfo("안내", "먼저 도면을 여세요.")
+            return
         hit = self._hit_point(e.x, e.y)
         if hit is not None:
             # 이미 찍은 점(또는 방향 화살표 끝)을 누르면 새로 찍지 않고 수정한다.
@@ -889,6 +1082,15 @@ class SweptPathApp:
             return
         if not self._drag:
             return
+        if self._drag[0] == TOOL_ERASE:
+            px, py = self._drag[3], self._drag[4]
+            self.canvas.delete("rubber")
+            if math.hypot(e.x - px, e.y - py) > 5:
+                self.canvas.delete("erasehl")
+                self._erase_key = None
+                self.canvas.create_rectangle(px, py, e.x, e.y, outline=COLOR_ERASE, dash=(4, 3), width=2,
+                                             fill="", tags=("rubber",))
+            return
         _tool, x, y, px, py = self._drag
         self.canvas.delete("rubber")
         self.canvas.create_line(px, py, e.x, e.y, arrow=tk.LAST, width=2, fill="#0070ff",
@@ -911,6 +1113,15 @@ class SweptPathApp:
             self.draw_path()
             return
         if not self._drag:
+            return
+        if self._drag[0] == TOOL_ERASE:
+            _tool, _x, _y, px, py, shift = self._drag
+            self._drag = None
+            self.canvas.delete("rubber")
+            if math.hypot(e.x - px, e.y - py) > 5:
+                self._erase_rect((px, py), (e.x, e.y))
+            else:
+                self._erase_click(px, py, shift)
             return
         tool, x, y, px, py = self._drag
         self._drag = None
@@ -1039,6 +1250,7 @@ class SweptPathApp:
         if hasattr(self, "layer_filter"):
             self.layer_filter.set("")
         self._fill_layer_list()
+        self.layer_list.yview_moveto(0)
         self._update_empty_state()
         self._update_steps()
         self.clear_results()
@@ -1054,18 +1266,33 @@ class SweptPathApp:
 
     def _fill_layer_list(self) -> None:
         """레이어 목록 (검색어가 있으면 이름에 검색어가 들어간 레이어만)."""
+        top = self.layer_list.yview()[0]
         self.layer_list.delete(0, tk.END)
         self._layer_view: list[str] = []
         if not self.drawing:
             self._update_layer_count()
+            self._update_erase_count()
             return
         q = self.layer_filter.get().strip().lower() if hasattr(self, "layer_filter") else ""
         self._layer_view = [n for n in self.layer_names if q in n.lower()] if q else list(self.layer_names)
+        total = self.drawing.layer_counts
+        active = self.drawing.active_layer_counts() if self.drawing.removed_count else total
         for i, name in enumerate(self._layer_view):
-            self.layer_list.insert(tk.END, f"{name}   ({self.drawing.layer_counts[name]:,})")
+            n_all, n_on = total[name], active.get(name, 0)
+            if n_on == 0:
+                label = f"{name}   (모두 지움)"
+            elif n_on < n_all:
+                label = f"{name}   ({n_on:,} · 지움 {n_all - n_on:,})"
+            else:
+                label = f"{name}   ({n_all:,})"
+            self.layer_list.insert(tk.END, label)
+            if n_on == 0:
+                self.layer_list.itemconfig(i, foreground=MUTED_LIST)
             if name in self.obstacle_layers:
                 self.layer_list.selection_set(i)
+        self.layer_list.yview_moveto(top)  # 다시 채워도 보던 위치 유지
         self._update_layer_count()
+        self._update_erase_count()
 
     def _update_layer_count(self) -> None:
         if not hasattr(self, "layer_count_var"):
@@ -1732,7 +1959,10 @@ class SweptPathApp:
             traceback.print_exc()
             messagebox.showerror("저장 실패", f"{type(exc).__name__}: {exc}")
             return
-        self.set_status(f"저장했습니다: {path}")
+        note = ""
+        if base and self.drawing.removed_count:
+            note = "  (원본 도면 위에 결과를 더한 것이라, 프로그램에서 지운 선도 원본대로 들어 있습니다)"
+        self.set_status(f"저장했습니다: {path}{note}")
 
     def export_figure_report(self, kind: str) -> None:
         """궤적 그림이 들어간 보고서 (PDF) 또는 그림 한 장 (PNG)."""
@@ -1783,6 +2013,9 @@ class SweptPathApp:
             "drawing": str(self.drawing.path) if self.drawing else None,
             "unit": self.unit_var.get(),
             "obstacle_layers": sorted(self.obstacle_layers),
+            # 프로그램 안에서 지운 선: 같은 도면을 다시 열면 선 번호가 같으므로 구간으로 저장
+            "removed_lines": self.drawing.removed_ranges() if self.drawing else [],
+            "line_count": len(self.drawing.polylines) if self.drawing else 0,
             "vehicle": self.vehicle.to_dict(),
             "start": list(self.start) if self.start else None,
             "scenario": scenario_to_dict(sc) if sc else None,
@@ -1806,6 +2039,14 @@ class SweptPathApp:
                     self.drawing.unit_scale = UNIT_CHOICES[data["unit"]]
                     self._dwg_base = None
                 self.obstacle_layers = set(data.get("obstacle_layers", [])) & set(self.layer_names)
+                if self.drawing and data.get("removed_lines"):
+                    if data.get("line_count") == len(self.drawing.polylines):
+                        self.drawing.apply_removed_ranges(data["removed_lines"])
+                        self._dwg_base = None
+                    else:
+                        messagebox.showwarning(
+                            "안내", "도면 파일이 저장 당시와 달라 '지운 선' 정보는 적용하지 않았습니다.\n"
+                                    "필요하면 선을 다시 지워 주세요.")
                 self._fill_layer_list()
             elif data.get("drawing"):
                 messagebox.showwarning("안내", f"도면 파일을 찾을 수 없습니다:\n{data['drawing']}")
