@@ -63,6 +63,11 @@ COLOR_CORNER = "#ff9a00"
 COLOR_SNAP = "#888888"
 COLOR_COLLISION = "#ff0000"
 
+# 주행 재생: 1x = 시속 10 km (주차장 서행 속도) 기준
+PLAY_BASE_MPS = 10 / 3.6
+PLAY_SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0, "4x": 4.0, "8x": 8.0}
+PLAY_FRAME_MS = 33
+
 SUBPROCESS_LOAD_MB = 8.0  # 이보다 큰 파일은 별도 프로세스에서 해석
 ASYNC_RENDER_LINES = 30000  # 화면에 보이는 선이 이보다 많으면 백그라운드에서 그림
 
@@ -505,6 +510,24 @@ class SweptPathApp:
         self.scrub_var = tk.DoubleVar(value=0.0)
         self.scrub = ttk.Scale(c3, from_=0, to=1, variable=self.scrub_var, command=lambda e: self.draw_scrub())
         self.scrub.pack(fill=tk.X, pady=(2, 0))
+        # 주행 재생 (시뮬레이션)
+        prow = ttk.Frame(c3, style="Inner.TFrame")
+        prow.pack(fill=tk.X, pady=(4, 0))
+        self.play_btn = ttk.Button(prow, text="▶ 주행 재생", width=12, command=self.toggle_play)
+        self.play_btn.pack(side=tk.LEFT)
+        ttk.Button(prow, text="⏮ 처음", width=7, command=self.rewind_play).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(prow, text="속도", style="Card.TLabel").pack(side=tk.LEFT, padx=(10, 2))
+        self.play_speed = tk.StringVar(value="1x")
+        ttk.Combobox(prow, textvariable=self.play_speed, values=list(PLAY_SPEEDS), width=5,
+                     state="readonly").pack(side=tk.LEFT)
+        self.play_loop = tk.BooleanVar(value=False)
+        ttk.Checkbutton(prow, text="반복", variable=self.play_loop,
+                        style="Card.TCheckbutton").pack(side=tk.LEFT, padx=(8, 0))
+        self.play_trail = tk.BooleanVar(value=True)
+        ttk.Checkbutton(prow, text="지나온 길", variable=self.play_trail, style="Card.TCheckbutton",
+                        command=self.draw_scrub).pack(side=tk.LEFT, padx=(8, 0))
+        self._play_job = None
+        self._play_t = 0.0
 
         self.verdict_card = tk.Label(tab, text="아직 검토 전입니다", font=self.fonts["header"], bg="#e5e7eb",
                                      fg=MUTED, pady=8)
@@ -596,6 +619,13 @@ class SweptPathApp:
                 self.fit_view()
 
         self.root.bind("<KeyPress-f>", fit_key)
+
+        def play_key(e):
+            if self.analysis is not None and not isinstance(
+                    e.widget, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox, ttk.Button, tk.Button)):
+                self.toggle_play()
+
+        self.root.bind("<space>", play_key)
         self.root.bind("<Control-Z>", lambda e: self.undo())
 
     def _zoom(self, cx, cy, f) -> None:
@@ -1797,6 +1827,7 @@ class SweptPathApp:
         if self.drawing:
             self.analysis_conditions["obstacle_layers"] = len(self.analysis_layers)
         self._show_result_summary(result)
+        self.stop_play()
         self.scrub.config(to=max(result.sim.total_distance, 0.01))
         self.scrub_var.set(0.0)
         self.draw_results()
@@ -1858,6 +1889,7 @@ class SweptPathApp:
         t.config(state="disabled")
 
     def clear_results(self) -> None:
+        self.stop_play()
         had = self.analysis is not None
         self.analysis = None
         self.analysis_scenario = None
@@ -1925,13 +1957,118 @@ class SweptPathApp:
         d = float(self.scrub_var.get())
         i = int(np.clip(np.searchsorted(a.sim.dist, d), 0, len(a.sim.dist) - 1))
         sim = a.sim
-        for poly in body_polygons(a.vehicle, sim.x[i], sim.y[i], sim.theta[i], sim.phi[i]).values():
-            c.create_polygon(self._flat(poly), outline="black", fill="#ffe08a", width=2,
-                             tags=("world", "scrub", "overlay"))
+        v = a.vehicle
+        tags = ("world", "scrub", "overlay")
+        # 지나온 길 (차량 기준점이 지나간 자리)
+        if self.play_trail.get() and i > 0:
+            step = max(1, i // 2000)
+            pts = np.column_stack([sim.x[: i + 1: step], sim.y[: i + 1: step]])
+            if len(pts) >= 2:
+                c.create_line(self._flat(pts), fill="#7c3aed", width=3, tags=tags)
+        # 지금 위치가 충돌 구간이면 빨갛게
+        hit = any(col.dist_from - 0.05 <= sim.dist[i] <= col.dist_to + 0.05 for col in a.collisions)
+        fill, outline = ("#fca5a5", COLOR_COLLISION) if hit else ("#ffe08a", "black")
+        for poly in body_polygons(v, sim.x[i], sim.y[i], sim.theta[i], sim.phi[i]).values():
+            c.create_polygon(self._flat(poly), outline=outline, fill=fill, width=2, tags=tags)
+        for poly in self._wheel_polygons(v, sim.x[i], sim.y[i], sim.theta[i], sim.phi[i], sim.steer[i]):
+            c.create_polygon(self._flat(poly), outline="", fill="#111827", tags=tags)
+        # 진행 방향 화살표 (전진: 앞쪽 / 후진: 뒤쪽)
+        th = sim.theta[i]
+        fwd = np.array([math.cos(th), math.sin(th)])
+        base = np.array([sim.x[i], sim.y[i]]) + fwd * (v.wheelbase / 2)
+        sign = 1.0 if sim.gear[i] == FORWARD else -1.0
+        tip = base + sign * fwd * max(v.wheelbase * 0.6, 1.5)
+        c.create_line(self._flat([base, tip]), fill=COLOR_PATH_FWD if sign > 0 else COLOR_PATH_REV,
+                      width=3, arrow=tk.LAST, tags=tags)
         gear = "전진" if sim.gear[i] == FORWARD else "후진"
         msg = f"주행 {sim.dist[i]:.1f} / {sim.total_distance:.1f} m · {gear} · 조향 {math.degrees(sim.steer[i]):+.1f}°"
+        if hit:
+            msg += " · ⚠ 충돌"
         self.scrub_label.set(msg)
         self.set_status(msg)
+
+    @staticmethod
+    def _wheel_polygons(v: Vehicle, x: float, y: float, theta: float, phi: float, steer: float) -> list:
+        """바퀴 4개(+트레일러 바퀴). 앞바퀴는 조향각만큼 꺾어서 그린다."""
+        def rect(cx, cy, ang, length, width):
+            c, s = math.cos(ang), math.sin(ang)
+            f = np.array([c, s]) * length / 2
+            l = np.array([-s, c]) * width / 2
+            p = np.array([cx, cy])
+            return np.array([p + f + l, p + f - l, p - f - l, p - f + l])
+
+        wl, ww = 0.9, 0.3
+        out = []
+        c, s = math.cos(theta), math.sin(theta)
+        fwd, left = np.array([c, s]), np.array([-s, c])
+        rear = np.array([x, y])
+        front = rear + v.wheelbase * fwd
+        ht = v.track / 2
+        for side in (1, -1):
+            r = rear + side * ht * left
+            out.append(rect(r[0], r[1], theta, wl, ww))
+            f = front + side * ht * left
+            out.append(rect(f[0], f[1], theta + steer, wl, ww))
+        if v.is_articulated and phi is not None and v.trailer_wheelbase > 0:
+            hitch = rear - v.hitch_offset * fwd
+            tf = np.array([math.cos(phi), math.sin(phi)])
+            tl = np.array([-math.sin(phi), math.cos(phi)])
+            axle = hitch - v.trailer_wheelbase * tf
+            tht = (v.trailer_track or v.trailer_width * 0.85) / 2
+            for side in (1, -1):
+                p = axle + side * tht * tl
+                out.append(rect(p[0], p[1], phi, wl, ww))
+        return out
+
+    # ---------------- 주행 재생 ----------------
+    def toggle_play(self) -> None:
+        if self._play_job is not None:
+            self.stop_play()
+            return
+        a = self.analysis
+        if a is None or len(a.sim.dist) == 0:
+            messagebox.showinfo("안내", "먼저 회전 검토를 실행하세요.")
+            return
+        if float(self.scrub_var.get()) >= a.sim.total_distance - 1e-6:
+            self.scrub_var.set(0.0)  # 끝에서 누르면 처음부터
+        self.play_btn.config(text="⏸ 일시정지")
+        self._play_t = time.perf_counter()
+        self._play_job = self.root.after(PLAY_FRAME_MS, self._play_tick)
+
+    def stop_play(self) -> None:
+        if self._play_job is not None:
+            self.root.after_cancel(self._play_job)
+            self._play_job = None
+        if hasattr(self, "play_btn"):
+            self.play_btn.config(text="▶ 주행 재생")
+
+    def rewind_play(self) -> None:
+        self.scrub_var.set(0.0)
+        self.draw_scrub()
+
+    def _play_tick(self) -> None:
+        self._play_job = None
+        a = self.analysis
+        if a is None or len(a.sim.dist) == 0:
+            self.stop_play()
+            return
+        now = time.perf_counter()
+        dt = min(now - self._play_t, 0.2)  # 창을 끌거나 멈칫해도 순간이동하지 않게
+        self._play_t = now
+        speed = PLAY_BASE_MPS * PLAY_SPEEDS.get(self.play_speed.get(), 1.0)
+        d = float(self.scrub_var.get()) + speed * dt
+        total = a.sim.total_distance
+        if d >= total:
+            if self.play_loop.get():
+                d = 0.0
+            else:
+                self.scrub_var.set(total)
+                self.draw_scrub()
+                self.stop_play()
+                return
+        self.scrub_var.set(d)
+        self.draw_scrub()
+        self._play_job = self.root.after(PLAY_FRAME_MS, self._play_tick)
 
     # ==================================================================
     # 저장
