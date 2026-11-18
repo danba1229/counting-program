@@ -20,6 +20,7 @@ RESULT_LAYERS = {
     "ST_VEHICLE": 8,  # 차량 윤곽 (회색)
     "ST_PATH": 6,  # 지정 경로 (자홍)
     "ST_COLLISION": 1,  # 충돌 위치 (빨강)
+    "ST_CLEARANCE_SHORT": 30,  # 여유폭 부족 위치 - 닿지는 않음 (주황)
     "ST_TEXT": 7,
 }
 
@@ -76,7 +77,8 @@ def export_dxf(analysis: Analysis, scenario: Scenario, out_path: str | Path,
     msp.add_lwpolyline(pts(np.array(path_pts)), dxfattribs={"layer": "ST_PATH"})
 
     for c in analysis.collisions:
-        msp.add_circle((c.x * k, c.y * k), 0.6 * k, dxfattribs={"layer": "ST_COLLISION"})
+        layer = "ST_COLLISION" if c.contact else "ST_CLEARANCE_SHORT"
+        msp.add_circle((c.x * k, c.y * k), 0.6 * k, dxfattribs={"layer": layer})
 
     if "ST_KOR" not in doc.styles:
         doc.styles.add("ST_KOR", font="malgun.ttf")  # 한글 표시용 (맑은 고딕)

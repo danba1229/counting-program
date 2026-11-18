@@ -168,9 +168,10 @@ def render_figure(analysis: Analysis, scenario: Scenario, size: tuple[int, int],
     for i, c in enumerate(analysis.collisions, 1):
         cx, cy = T((c.x, c.y))
         rr = 16 * line_scale
-        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=C_NG, width=lw + 2)
+        color = C_NG if c.contact else C_WARN
+        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], outline=color, width=lw + 2)
         if labels:
-            d.text((cx + rr + 4, cy - rr), f"충돌 {i}", fill=C_NG, font=f_lbl)
+            d.text((cx + rr + 4, cy - rr), f"{'충돌' if c.contact else '여유폭 부족'} {i}", fill=color, font=f_lbl)
 
     # 축척 막대, 북쪽(위) 표시
     length = _nice_length(0.18 * w / s)
@@ -184,7 +185,7 @@ def render_figure(analysis: Analysis, scenario: Scenario, size: tuple[int, int],
 
 def _legend(d: ImageDraw.ImageDraw, x: int, y: int) -> None:
     items = [("차체 궤적", C_ENV, 5), ("여유폭 외곽", C_CLEAR, 2), ("바퀴 궤적", C_WHEEL, 2),
-             ("경로(전진)", C_FWD, 3), ("경로(후진)", C_REV, 3), ("충돌", C_NG, 0)]
+             ("경로(전진)", C_FWD, 3), ("경로(후진)", C_REV, 3), ("충돌", C_NG, 0), ("여유폭 부족", C_WARN, 0)]
     f = font(22)
     for label, color, width in items:
         if width:
@@ -271,7 +272,9 @@ def _detail_page(analysis: Analysis, drawing_name: str, conditions: dict | None,
             ("총 주행거리", f"{sim.total_distance:.1f} m"),
             ("구간 / 방향전환", f"{len(sim.legs)}구간 / {max(len(sim.legs) - 1, 0)}회"),
             ("사용 최대 조향각", f"{analysis.max_steer_deg:.1f}°"),
-            ("충돌·여유폭 부족", f"{len(analysis.collisions)}곳")]
+            ("충돌", f"{analysis.contact_count}곳"),
+            ("여유폭 부족 (닿지 않음)", f"{analysis.clearance_count}곳"),
+            ("차체-장애물 최소 이격", analysis.min_gap_text())]
     if v.is_articulated:
         rows.append(("최대 꺾임각", f"{analysis.max_articulation_deg:.1f}°"))
     y = table(x2, y0 + 20, "검토 결과", rows)
@@ -292,7 +295,8 @@ def _detail_page(analysis: Analysis, drawing_name: str, conditions: dict | None,
                       C_TEXT if leg.reached else C_NG))
     for i, c in enumerate(analysis.collisions, 1):
         part = "트레일러" if c.part == "trailer" else "차체"
-        lines.append((f"충돌 {i}: {part}  x={c.x:,.2f}, y={c.y:,.2f}  (주행 {c.dist_from:.1f}~{c.dist_to:.1f} m)", C_TEXT))
+        lines.append((f"{c.label} {i}: {part}  x={c.x:,.2f}, y={c.y:,.2f}  (주행 {c.dist_from:.1f}~{c.dist_to:.1f} m, "
+                      f"최소 이격 {c.min_gap:.2f} m)", C_NG if c.contact else C_WARN))
     limit = PAGE[1] - 150
     for text, color in lines:
         for line in _wrap(d, text, f, col_w):
@@ -331,7 +335,8 @@ def build_pages(analysis: Analysis, scenario: Scenario, drawing=None, obstacle_l
     d.rectangle(fig_box, outline=C_BORDER, width=2)
     sim = analysis.sim
     info = (f"{analysis.vehicle.name}  ·  주행 {sim.total_distance:.1f} m  ·  방향전환 {max(len(sim.legs) - 1, 0)}회"
-            f"  ·  충돌 {len(analysis.collisions)}곳" + (f"  ·  도면: {drawing_name}" if drawing_name else ""))
+            f"  ·  충돌 {analysis.contact_count}곳 · 여유폭 부족 {analysis.clearance_count}곳 · 최소 이격 "
+            f"{analysis.min_gap_text()}" + (f"  ·  도면: {drawing_name}" if drawing_name else ""))
     d.text((MARGIN, top + 14), info, fill=C_TEXT, font=font(26))
     _legend(d, MARGIN, PAGE[1] - 112)
     d.text((MARGIN, PAGE[1] - 60), f"작성 {datetime.now():%Y-%m-%d %H:%M}  ·  차량 회전 궤적 검토 프로그램",
@@ -342,7 +347,7 @@ def build_pages(analysis: Analysis, scenario: Scenario, drawing=None, obstacle_l
     if ncol:
         p3 = Image.new("RGB", PAGE, (255, 255, 255))
         d = ImageDraw.Draw(p3)
-        top = _header(d, "충돌 위치 확대도", analysis, 3, pages)
+        top = _header(d, "충돌·여유폭 부족 위치 확대도", analysis, 3, pages)
         cols = 1 if ncol == 1 else 2
         rows_n = 1 if ncol <= 2 else 2
         gap = 30
@@ -359,9 +364,10 @@ def build_pages(analysis: Analysis, scenario: Scenario, drawing=None, obstacle_l
             p3.paste(fig, (x, y))
             d.rectangle([x, y, x + cw, y + ch], outline=C_BORDER, width=2)
             part = "트레일러" if c.part == "trailer" else "차체"
-            d.text((x + 4, y - 40), f"충돌 {i + 1}: {part}  x={c.x:,.2f}, y={c.y:,.2f} m", fill=C_NG, font=font(26, True))
+            d.text((x + 4, y - 40), f"{c.label} {i + 1}: {part}  x={c.x:,.2f}, y={c.y:,.2f} m  (최소 이격 {c.min_gap:.2f} m)",
+                   fill=C_NG if c.contact else C_WARN, font=font(26, True))
         if len(analysis.collisions) > 4:
-            d.text((MARGIN, PAGE[1] - 100), f"※ 충돌 {len(analysis.collisions)}곳 중 앞의 4곳만 표시",
+            d.text((MARGIN, PAGE[1] - 100), f"※ {len(analysis.collisions)}곳 중 앞의 4곳만 표시",
                    fill=C_MUTED, font=font(22))
         out.append(p3)
     return out

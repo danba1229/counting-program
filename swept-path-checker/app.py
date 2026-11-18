@@ -62,6 +62,7 @@ COLOR_WHEEL = "#00a040"
 COLOR_CORNER = "#ff9a00"
 COLOR_SNAP = "#888888"
 COLOR_COLLISION = "#ff0000"
+COLOR_SHORT = "#f59e0b"  # 여유폭 부족 (닿지는 않음)
 
 # 주행 재생: 1x = 시속 10 km (주차장 서행 속도) 기준
 PLAY_BASE_MPS = 10 / 3.6
@@ -196,9 +197,11 @@ class SweptPathApp:
 
         run_frame = ttk.Frame(left)
         run_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        self.compare_btn = ttk.Button(run_frame, text="모든 차량 비교", command=self.compare_all_vehicles)
+        self.compare_btn.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
         self.run_btn = ttk.Button(run_frame, text="▶  회전 검토 실행   (Ctrl+Enter)", style="Accent.TButton",
                                   command=self.run_check)
-        self.run_btn.pack(fill=tk.X)
+        self.run_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.nb = ttk.Notebook(left)
         self.nb.pack(fill=tk.BOTH, expand=True)
@@ -270,7 +273,8 @@ class SweptPathApp:
         items = [("장애물 선", COLOR_OBSTACLE, "line"), ("장애물 아님", COLOR_OTHER, "line"),
                  ("경로 (전진)", COLOR_PATH_FWD, "line"), ("경로 (후진)", COLOR_PATH_REV, "dash"),
                  ("차체 궤적", COLOR_ENVELOPE, "box"), ("여유폭", COLOR_CLEAR, "dash"),
-                 ("바퀴 궤적", COLOR_WHEEL, "line"), ("충돌", COLOR_COLLISION, "circle")]
+                 ("바퀴 궤적", COLOR_WHEEL, "line"), ("충돌", COLOR_COLLISION, "circle"),
+                 ("여유폭 부족", COLOR_SHORT, "circle")]
         for i, (label, color, kind) in enumerate(items):
             c = tk.Canvas(lg, width=26, height=12, bg="#ffffff", highlightthickness=0)
             if kind == "box":
@@ -1762,6 +1766,79 @@ class SweptPathApp:
                     float(sim.x.max()) + reach, float(sim.y.max()) + reach)
         return build_obstacles(self.drawing.polylines_m(set(self.obstacle_layers), bbox_m=bbox))
 
+    def compare_all_vehicles(self, wait: bool = False) -> None:
+        """같은 경로·조건으로 등록된 모든 차량을 검토해 표로 비교한다."""
+        if self._busy:
+            return
+        sc = self.scenario()
+        if sc is None:
+            messagebox.showinfo("안내", "출발점과 목적지(또는 경유점)를 지정하세요.")
+            return
+        try:
+            sim_opt, chk_opt = self._options()
+        except ValueError as exc:
+            messagebox.showerror("입력 오류", str(exc))
+            return
+        vehicles = list(self.library.vehicles.values())
+        self._busy = True
+        self.run_btn.config(state="disabled")
+        self.compare_btn.config(state="disabled", text="비교 중...")
+        q: queue.Queue = queue.Queue()
+
+        def work():
+            rows = []
+            for n, v in enumerate(vehicles, 1):
+                q.put(("progress", f"{v.name} 검토 중... ({n}/{len(vehicles)})"))
+                errs = v.validate()
+                if errs:
+                    rows.append((v, None, "제원 오류: " + " / ".join(errs)))
+                    continue
+                try:
+                    sim = Simulator(v, sim_opt).run(sc)
+                    lines, tree = self._obstacles(sim, v, chk_opt.clearance)
+                    rows.append((v, analyze(v, sim, lines, tree, chk_opt), ""))
+                except Exception as exc:
+                    traceback.print_exc()
+                    rows.append((v, None, f"{type(exc).__name__}: {exc}"))
+            q.put(("done", rows))
+
+        def finish(rows):
+            self._busy = False
+            self.run_btn.config(state="normal")
+            self.compare_btn.config(state="normal", text="모든 차량 비교")
+            ok = sum(1 for _v, a, _e in rows if a is not None and a.feasible)
+            self.set_status(f"차량 {len(rows)}종 비교 완료: 가능 {ok}종, 불가 {len(rows) - ok}종")
+            self.compare_dialog = CompareDialog(self.root, self, rows, sc)
+
+        def poll():
+            try:
+                while True:
+                    kind, payload = q.get_nowait()
+                    if kind == "progress":
+                        self.set_status(payload)
+                    else:
+                        finish(payload)
+                        return
+            except queue.Empty:
+                pass
+            self.root.after(50, poll)
+
+        if wait:  # 테스트용: 바로 실행
+            work()
+            while True:
+                kind, payload = q.get()
+                if kind == "done":
+                    finish(payload)
+                    return
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(50, poll)
+
+    def show_compared_result(self, vehicle: Vehicle, analysis: Analysis, sc: Scenario) -> None:
+        """비교 표에서 고른 차량의 결과를 화면에 띄운다."""
+        self.vehicle_var.set(vehicle.name)
+        self._on_vehicle_change()
+        self._on_result(analysis, sc)
+
     def run_check(self) -> None:
         if self._busy:
             return
@@ -1852,7 +1929,9 @@ class SweptPathApp:
             ("총 주행거리", f"{sim.total_distance:.1f} m"),
             ("구간 / 방향전환", f"{len(sim.legs)}구간 / {max(len(sim.legs) - 1, 0)}회"),
             ("사용 최대 조향각", f"{a.max_steer_deg:.1f}° (한계 {math.degrees(v.max_steer_rad):.1f}°)"),
-            ("충돌·여유폭 부족", f"{len(a.collisions)}곳"),
+            ("충돌", f"{a.contact_count}곳"),
+            ("여유폭 부족", f"{a.clearance_count}곳 (닿지 않음)" if a.clearance_count else "0곳"),
+            ("최소 이격", a.min_gap_text()),
         ]
         if v.is_articulated:
             metrics.append(("최대 꺾임각", f"{a.max_articulation_deg:.1f}° (한계 {v.max_articulation_deg:.0f}°)"))
@@ -1862,8 +1941,11 @@ class SweptPathApp:
             ttk.Label(self.metric_frame, text=k, style="CardMuted.TLabel").grid(row=r, column=0, sticky="w", pady=1)
             lbl = ttk.Label(self.metric_frame, text=val, style="Value.TLabel")
             lbl.grid(row=r, column=1, sticky="w", padx=(10, 0))
-            if k.startswith("충돌") and a.collisions:
+            if (k == "충돌" and a.contact_count) or (k == "최소 이격" and a.min_gap is not None
+                                                  and a.min_gap <= 1e-6):
                 lbl.configure(foreground=DANGER)
+            elif k == "여유폭 부족" and a.clearance_count:
+                lbl.configure(foreground=WARN)
         t = self.result_text
         t.config(state="normal")
         t.delete("1.0", tk.END)
@@ -1882,10 +1964,12 @@ class SweptPathApp:
             t.insert(tk.END, line + (f" · {leg.message}" if leg.message else "") + "\n",
                      () if leg.reached else ("bad",))
         if a.collisions:
-            t.insert(tk.END, "충돌 위치\n", "head")
+            t.insert(tk.END, "충돌·여유폭 부족 위치\n", "head")
             for i, c in enumerate(a.collisions, 1):
                 part = "트레일러" if c.part == "trailer" else "차체"
-                t.insert(tk.END, f"{i}. {part}  x={c.x:,.2f}, y={c.y:,.2f}  (주행 {c.dist_from:.1f}~{c.dist_to:.1f} m)\n")
+                t.insert(tk.END, f"{i}. [{c.label}] {part}  x={c.x:,.2f}, y={c.y:,.2f}  "
+                                 f"(주행 {c.dist_from:.1f}~{c.dist_to:.1f} m, 최소 이격 {c.min_gap:.2f} m)\n",
+                         ("bad",) if c.contact else ("warn",))
         t.config(state="disabled")
 
     def clear_results(self) -> None:
@@ -1941,8 +2025,9 @@ class SweptPathApp:
                               tags=tags)
         for i, col in enumerate(a.collisions, 1):
             px, py = self.w2c(col.x, col.y)
-            c.create_oval(px - 10, py - 10, px + 10, py + 10, outline=COLOR_COLLISION, width=3, tags=tags)
-            c.create_text(px + 12, py + 12, text=f"충돌{i}", fill=COLOR_COLLISION, anchor="w",
+            color = COLOR_COLLISION if col.contact else COLOR_SHORT
+            c.create_oval(px - 10, py - 10, px + 10, py + 10, outline=color, width=3, tags=tags)
+            c.create_text(px + 12, py + 12, text=f"{'충돌' if col.contact else '여유'}{i}", fill=color, anchor="w",
                           font=("", 10, "bold"), tags=tags)
         c.tag_raise("path")
         c.tag_raise("result")
@@ -1966,8 +2051,14 @@ class SweptPathApp:
             if len(pts) >= 2:
                 c.create_line(self._flat(pts), fill="#7c3aed", width=3, tags=tags)
         # 지금 위치가 충돌 구간이면 빨갛게
-        hit = any(col.dist_from - 0.05 <= sim.dist[i] <= col.dist_to + 0.05 for col in a.collisions)
-        fill, outline = ("#fca5a5", COLOR_COLLISION) if hit else ("#ffe08a", "black")
+        here = [col for col in a.collisions if col.dist_from - 0.05 <= sim.dist[i] <= col.dist_to + 0.05]
+        hit = next((col for col in here if getattr(col, "contact", True)), None) or (here[0] if here else None)
+        if hit is None:
+            fill, outline = "#ffe08a", "black"
+        elif getattr(hit, "contact", True):
+            fill, outline = "#fca5a5", COLOR_COLLISION  # 닿음: 빨강
+        else:
+            fill, outline = "#fed7aa", "#ea580c"  # 여유폭 부족: 주황
         for poly in body_polygons(v, sim.x[i], sim.y[i], sim.theta[i], sim.phi[i]).values():
             c.create_polygon(self._flat(poly), outline=outline, fill=fill, width=2, tags=tags)
         for poly in self._wheel_polygons(v, sim.x[i], sim.y[i], sim.theta[i], sim.phi[i], sim.steer[i]):
@@ -1982,8 +2073,8 @@ class SweptPathApp:
                       width=3, arrow=tk.LAST, tags=tags)
         gear = "전진" if sim.gear[i] == FORWARD else "후진"
         msg = f"주행 {sim.dist[i]:.1f} / {sim.total_distance:.1f} m · {gear} · 조향 {math.degrees(sim.steer[i]):+.1f}°"
-        if hit:
-            msg += " · ⚠ 충돌"
+        if hit is not None:
+            msg += f" · ⚠ {getattr(hit, 'label', '충돌')}"
         self.scrub_label.set(msg)
         self.set_status(msg)
 
@@ -2215,6 +2306,84 @@ class SweptPathApp:
 
     def set_status(self, text: str) -> None:
         self.status.set(text)
+
+
+class CompareDialog(tk.Toplevel):
+    """모든 차량 비교 결과 표."""
+
+    COLUMNS = (("vehicle", "차량", 190), ("verdict", "판정", 70), ("contact", "충돌", 50),
+               ("short", "여유폭 부족", 80), ("gap", "최소 이격", 80), ("steer", "최대 조향", 75),
+               ("reason", "주요 사유", 330))
+
+    def __init__(self, master, app: "SweptPathApp", rows, scenario: Scenario):
+        super().__init__(master)
+        self.app, self.rows, self.sc = app, rows, scenario
+        self.title("모든 차량 비교")
+        self.transient(master)
+        self.geometry("900x320")
+        bar = ttk.Frame(self, padding=(8, 6))
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(bar, text="같은 경로·검토 조건으로 검토했습니다. 행을 두 번 누르면 그 차량의 궤적을 봅니다.",
+                  style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Button(bar, text="닫기", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(bar, text="표 저장 (CSV)", command=self.save_csv).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bar, text="선택 차량 결과 보기", style="Accent.TButton", command=self.show_selected).pack(
+            side=tk.RIGHT)
+        frame = ttk.Frame(self, padding=(8, 8, 8, 0))
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in self.COLUMNS], show="headings", height=8)
+        for key, label, width in self.COLUMNS:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor="w" if key in ("vehicle", "reason") else "center",
+                             stretch=key == "reason")
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.tag_configure("ok", foreground=SUCCESS)
+        self.tree.tag_configure("ng", foreground=DANGER)
+        for i, values in enumerate(self.table()):
+            a = rows[i][1]
+            self.tree.insert("", tk.END, iid=str(i), values=values,
+                             tags=("ok",) if a is not None and a.feasible else ("ng",))
+        self.tree.bind("<Double-1>", lambda e: self.show_selected())
+
+    def table(self) -> list[tuple]:
+        out = []
+        for v, a, err in self.rows:
+            if a is None:
+                out.append((v.name, "오류", "-", "-", "-", "-", err))
+                continue
+            verdict = "가능" + (" (주의)" if a.warnings else "") if a.feasible else "불가"
+            reason = "; ".join(a.reasons) if a.reasons else ("; ".join(a.warnings) if a.warnings else "")
+            out.append((v.name, verdict, a.contact_count, a.clearance_count, a.min_gap_text(),
+                        f"{a.max_steer_deg:.1f}°", reason))
+        return out
+
+    def show_selected(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("안내", "표에서 차량을 고르세요.", parent=self)
+            return
+        v, a, err = self.rows[int(sel[0])]
+        if a is None:
+            messagebox.showinfo("안내", f"이 차량은 검토하지 못했습니다.\n{err}", parent=self)
+            return
+        self.app.show_compared_result(v, a, self.sc)
+
+    def save_csv(self, path: str | None = None) -> None:
+        import csv
+
+        if path is None:
+            path = filedialog.asksaveasfilename(parent=self, defaultextension=".csv", initialfile="차량비교.csv",
+                                                filetypes=[("CSV (엑셀에서 열림)", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:  # BOM: 엑셀에서 한글이 깨지지 않게
+            w = csv.writer(f)
+            w.writerow([c[1] for c in self.COLUMNS])
+            w.writerows(self.table())
+        self.app.set_status(f"비교 표를 저장했습니다: {path}")
 
 
 class PointDialog(tk.Toplevel):

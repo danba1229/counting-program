@@ -263,3 +263,32 @@ def test_project_saves_removed_lines(gui_with_sample, tmp_path, monkeypatch):
     a.load_project()
     assert a.drawing.removed_count == 4
     assert len(a.drawing.layer_lines("기둥")) == 0
+
+
+def test_compare_all_vehicles(gui_with_sample, tmp_path):
+    a, appmod = gui_with_sample
+    # 샘플 도면 90° 코너: 소형·카운티 가능, 대형·세미트레일러 불가
+    a.start = (18.0, 3.5, 0.0)
+    a.waypoints = [appmod.Waypoint(30, 3.5), appmod.Waypoint(36.5, 10)]
+    a.dest = appmod.Waypoint(36.5, 32, appmod.FORWARD, math.pi / 2)
+    a._path_changed()
+    a.compare_all_vehicles(wait=True)
+    dlg = a.compare_dialog
+    table = {row[0]: row for row in dlg.table()}
+    assert table["소형자동차 (설계기준)"][1].startswith("가능")
+    assert table["미니버스 (카운티 장축)"][1].startswith("가능")
+    assert table["대형자동차 (설계기준)"][1] == "불가"
+    assert table["세미트레일러 (설계기준)"][1] == "불가"
+    assert str(a.compare_btn.cget("state")) == "normal" and not a._busy
+    # 표에서 고른 차량 결과를 화면에 띄우기
+    names = [v.name for v, _a, _e in dlg.rows]
+    i = names.index("대형자동차 (설계기준)")
+    dlg.tree.selection_set(str(i))
+    dlg.show_selected()
+    assert a.vehicle.name == "대형자동차 (설계기준)" and a.analysis is not None and not a.analysis.feasible
+    # CSV 저장 (엑셀용 BOM)
+    p = tmp_path / "cmp.csv"
+    dlg.save_csv(str(p))
+    text = p.read_bytes()
+    assert text.startswith(b"\xef\xbb\xbf") and "세미트레일러" in text.decode("utf-8-sig")
+    dlg.destroy()
